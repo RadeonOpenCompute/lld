@@ -267,6 +267,8 @@ void Writer::run() {
 
   writeMapFile(OutputSections);
 
+  writeMapFile(OutputSections);
+
   if (auto EC = Buffer->commit())
     fatal(EC, "failed to write the output file");
 }
