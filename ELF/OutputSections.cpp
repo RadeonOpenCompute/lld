@@ -330,6 +330,10 @@ static SectionKey createKey(InputSectionBase *C, StringRef OutsecName) {
   return SectionKey{OutsecName, Flags, Alignment};
 }
 
+template <class ELFT> OutputSectionFactory<ELFT>::OutputSectionFactory() {}
+
+template <class ELFT> OutputSectionFactory<ELFT>::~OutputSectionFactory() {}
+
 template <class ELFT>
 OutputSectionFactory<ELFT>::OutputSectionFactory(
     std::vector<OutputSectionBase *> &OutputSections)

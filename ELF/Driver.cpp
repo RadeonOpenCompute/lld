@@ -591,6 +591,9 @@ void LinkerDriver::readConfigs(opt::InputArgList &Args) {
   if (Args.hasArg(OPT_print_map))
     Config->MapFile = "-";
 
+  if (Args.hasArg(OPT_print_map))
+    Config->MapFile = "-";
+
   // --omagic is an option to create old-fashioned executables in which
   // .text segments are writable. Today, the option is still in use to
   // create special-purpose programs such as boot loaders. It doesn't
