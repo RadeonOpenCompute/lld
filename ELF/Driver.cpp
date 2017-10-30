@@ -74,13 +74,19 @@ bool elf::link(ArrayRef<const char *> Args, bool CanExitEarly,
                raw_ostream &Error) {
   ErrorCount = 0;
   ErrorOS = &Error;
-  Argv0 = Args[0];
   InputSections.clear();
+  OutputSections.clear();
   Tar = nullptr;
+  BinaryFiles.clear();
+  BitcodeFiles.clear();
+  ObjectFiles.clear();
+  SharedFiles.clear();
 
   Config = make<Configuration>();
   Driver = make<LinkerDriver>();
   Script = make<LinkerScript>();
+  Symtab = make<SymbolTable>();
+  Config->Argv = {Args.begin(), Args.end()};
 
   Driver->main(Args, CanExitEarly);
   freeArena();
@@ -112,12 +118,8 @@ static std::tuple<ELFKind, uint16_t, uint8_t> parseEmulation(StringRef Emul) {
           .Case("elf_iamcu", {ELF32LEKind, EM_IAMCU})
           .Default({ELFNoneKind, EM_NONE});
 
-  if (Ret.first == ELFNoneKind) {
-    if (S == "i386pe" || S == "i386pep" || S == "thumb2pe")
-      error("Windows targets are not supported on the ELF frontend: " + Emul);
-    else
-      error("unknown emulation: " + Emul);
-  }
+  if (Ret.first == ELFNoneKind)
+    error("unknown emulation: " + Emul);
   return std::make_tuple(Ret.first, Ret.second, OSABI);
 }
 
@@ -131,6 +133,7 @@ std::vector<std::pair<MemoryBufferRef, uint64_t>> static getArchiveMembers(
 
   std::vector<std::pair<MemoryBufferRef, uint64_t>> V;
   Error Err = Error::success();
+  bool AddToTar = File->isThin() && Tar;
   for (const ErrorOr<Archive::Child> &COrErr : File->children(Err)) {
     Archive::Child C =
         check(COrErr, MB.getBufferIdentifier() +
@@ -139,6 +142,8 @@ std::vector<std::pair<MemoryBufferRef, uint64_t>> static getArchiveMembers(
         check(C.getMemoryBufferRef(),
               MB.getBufferIdentifier() +
                   ": could not get the buffer for a child of the archive");
+    if (AddToTar)
+      Tar->append(relativeToRoot(check(C.getFullName())), MBRef.getBuffer());
     V.push_back(std::make_pair(MBRef, C.getChildOffset()));
   }
   if (Err)
@@ -187,7 +192,7 @@ void LinkerDriver::addFile(StringRef Path, bool WithLOption) {
     // we'll handle it as if it had a symbol table.
     if (!File->isEmpty() && !File->hasSymbolTable()) {
       for (const auto &P : getArchiveMembers(MBRef))
-        Files.push_back(make<LazyObjectFile>(P.first, Path, P.second));
+        Files.push_back(make<LazyObjFile>(P.first, Path, P.second));
       return;
     }
 
@@ -216,7 +221,7 @@ void LinkerDriver::addFile(StringRef Path, bool WithLOption) {
     return;
   default:
     if (InLib)
-      Files.push_back(make<LazyObjectFile>(MBRef, "", 0));
+      Files.push_back(make<LazyObjFile>(MBRef, "", 0));
     else
       Files.push_back(createObjectFile(MBRef));
   }
@@ -259,6 +264,9 @@ static void checkOptions(opt::InputArgList &Args) {
   if (Config->Pie && Config->Shared)
     error("-shared and -pie may not be used together");
 
+  if (!Config->Shared && !Config->FilterList.empty())
+    error("-F may not be used without -shared");
+
   if (!Config->Shared && !Config->AuxiliaryList.empty())
     error("-f may not be used without -shared");
 
@@ -279,7 +287,7 @@ static int getInteger(opt::InputArgList &Args, unsigned Key, int Default) {
   if (auto *Arg = Args.getLastArg(Key)) {
     StringRef S = Arg->getValue();
     if (!to_integer(S, V, 10))
-      error(Arg->getSpelling() + ": number expected, but got " + S);
+      error(Arg->getSpelling() + ": number expected, but got '" + S + "'");
   }
   return V;
 }
@@ -415,9 +423,6 @@ static std::string getRpath(opt::InputArgList &Args) {
 // Determines what we should do if there are remaining unresolved
 // symbols after the name resolution.
 static UnresolvedPolicy getUnresolvedSymbolPolicy(opt::InputArgList &Args) {
-  // -noinhibit-exec or -r imply some default values.
-  if (Args.hasArg(OPT_noinhibit_exec))
-    return UnresolvedPolicy::WarnAll;
   if (Args.hasArg(OPT_relocatable))
     return UnresolvedPolicy::IgnoreAll;
 
@@ -610,12 +615,21 @@ static bool getCompressDebugSections(opt::InputArgList &Args) {
   return true;
 }
 
+static int parseInt(StringRef S, opt::Arg *Arg) {
+  int V = 0;
+  if (!to_integer(S, V, 10))
+    error(Arg->getSpelling() + ": number expected, but got '" + S + "'");
+  return V;
+}
+
 // Initializes Config members by the command line options.
 void LinkerDriver::readConfigs(opt::InputArgList &Args) {
-  Config->AllowMultipleDefinition = Args.hasArg(OPT_allow_multiple_definition);
+  Config->AllowMultipleDefinition =
+      Args.hasArg(OPT_allow_multiple_definition) || hasZOption(Args, "muldefs");
   Config->AuxiliaryList = getArgs(Args, OPT_auxiliary);
   Config->Bsymbolic = Args.hasArg(OPT_Bsymbolic);
   Config->BsymbolicFunctions = Args.hasArg(OPT_Bsymbolic_functions);
+  Config->Chroot = Args.getLastArgValue(OPT_chroot);
   Config->CompressDebugSections = getCompressDebugSections(Args);
   Config->DefineCommon = getArg(Args, OPT_define_common, OPT_no_define_common,
                                 !Args.hasArg(OPT_relocatable));
@@ -623,7 +637,8 @@ void LinkerDriver::readConfigs(opt::InputArgList &Args) {
   Config->DisableVerify = Args.hasArg(OPT_disable_verify);
   Config->Discard = getDiscard(Args);
   Config->DynamicLinker = getDynamicLinker(Args);
-  Config->EhFrameHdr = Args.hasArg(OPT_eh_frame_hdr);
+  Config->EhFrameHdr =
+      getArg(Args, OPT_eh_frame_hdr, OPT_no_eh_frame_hdr, false);
   Config->EmitRelocs = Args.hasArg(OPT_emit_relocs);
   Config->EnableNewDtags = !Args.hasArg(OPT_disable_new_dtags);
   Config->Entry = Args.getLastArgValue(OPT_entry);
@@ -631,10 +646,11 @@ void LinkerDriver::readConfigs(opt::InputArgList &Args) {
       getArg(Args, OPT_export_dynamic, OPT_no_export_dynamic, false);
   Config->FatalWarnings =
       getArg(Args, OPT_fatal_warnings, OPT_no_fatal_warnings, false);
+  Config->FilterList = getArgs(Args, OPT_filter);
   Config->Fini = Args.getLastArgValue(OPT_fini, "_fini");
   Config->GcSections = getArg(Args, OPT_gc_sections, OPT_no_gc_sections, false);
-  Config->GdbIndex = Args.hasArg(OPT_gdb_index);
-  Config->ICF = Args.hasArg(OPT_icf);
+  Config->GdbIndex = getArg(Args, OPT_gdb_index, OPT_no_gdb_index, false);
+  Config->ICF = getArg(Args, OPT_icf_all, OPT_icf_none, false);
   Config->Init = Args.getLastArgValue(OPT_init, "_init");
   Config->LTOAAPipeline = Args.getLastArgValue(OPT_lto_aa_pipeline);
   Config->LTONewPmPasses = Args.getLastArgValue(OPT_lto_newpm_passes);
@@ -643,6 +659,7 @@ void LinkerDriver::readConfigs(opt::InputArgList &Args) {
   Config->MapFile = Args.getLastArgValue(OPT_Map);
   Config->NoGnuUnique = Args.hasArg(OPT_no_gnu_unique);
   Config->NoUndefinedVersion = Args.hasArg(OPT_no_undefined_version);
+  Config->NoinhibitExec = Args.hasArg(OPT_noinhibit_exec);
   Config->Nostdlib = Args.hasArg(OPT_nostdlib);
   Config->OFormatBinary = isOutputFormatBinary(Args);
   Config->Omagic = Args.hasArg(OPT_omagic);
@@ -655,7 +672,7 @@ void LinkerDriver::readConfigs(opt::InputArgList &Args) {
   Config->Rpath = getRpath(Args);
   Config->Relocatable = Args.hasArg(OPT_relocatable);
   Config->SaveTemps = Args.hasArg(OPT_save_temps);
-  Config->SearchPaths = getArgs(Args, OPT_L);
+  Config->SearchPaths = getArgs(Args, OPT_library_path);
   Config->SectionStartMap = getSectionStartMap(Args);
   Config->Shared = Args.hasArg(OPT_shared);
   Config->SingleRoRx = Args.hasArg(OPT_no_rosegment);
@@ -689,16 +706,35 @@ void LinkerDriver::readConfigs(opt::InputArgList &Args) {
   Config->ZText = !hasZOption(Args, "notext");
   Config->ZWxneeded = hasZOption(Args, "wxneeded");
 
+  // Parse LTO plugin-related options for compatibility with gold.
+  for (auto *Arg : Args.filtered(OPT_plugin_opt, OPT_plugin_opt_eq)) {
+    StringRef S = Arg->getValue();
+    if (S == "disable-verify")
+      Config->DisableVerify = true;
+    else if (S == "save-temps")
+      Config->SaveTemps = true;
+    else if (S.startswith("O"))
+      Config->LTOO = parseInt(S.substr(1), Arg);
+    else if (S.startswith("lto-partitions="))
+      Config->LTOPartitions = parseInt(S.substr(15), Arg);
+    else if (S.startswith("jobs="))
+      Config->ThinLTOJobs = parseInt(S.substr(5), Arg);
+    else if (!S.startswith("/") && !S.startswith("-fresolution=") &&
+             !S.startswith("-pass-through=") && !S.startswith("mcpu=") &&
+             !S.startswith("thinlto") && S != "-function-sections" &&
+             S != "-data-sections")
+      error(Arg->getSpelling() + ": unknown option: " + S);
+  }
+
   if (Config->LTOO > 3)
-    error("invalid optimization level for LTO: " +
-          Args.getLastArgValue(OPT_lto_O));
+    error("invalid optimization level for LTO: " + Twine(Config->LTOO));
   if (Config->LTOPartitions == 0)
     error("--lto-partitions: number of threads must be > 0");
   if (Config->ThinLTOJobs == 0)
     error("--thinlto-jobs: number of threads must be > 0");
 
+  // Parse ELF{32,64}{LE,BE} and CPU type.
   if (auto *Arg = Args.getLastArg(OPT_m)) {
-    // Parse ELF{32,64}{LE,BE} and CPU type.
     StringRef S = Arg->getValue();
     std::tie(Config->EKind, Config->EMachine, Config->OSABI) =
         parseEmulation(S);
@@ -800,14 +836,13 @@ static bool getBinaryOption(StringRef S) {
 
 void LinkerDriver::createFiles(opt::InputArgList &Args) {
   for (auto *Arg : Args) {
-    switch (Arg->getOption().getID()) {
-    case OPT_l:
+    switch (Arg->getOption().getUnaliasedOption().getID()) {
+    case OPT_library:
       addLibrary(Arg->getValue());
       break;
     case OPT_INPUT:
       addFile(Arg->getValue(), /*WithLOption=*/false);
       break;
-    case OPT_alias_script_T:
     case OPT_script:
       if (Optional<MemoryBufferRef> MB = readFile(Arg->getValue()))
         readLinkerScript(*MB);
@@ -939,15 +974,13 @@ static void excludeLibs(opt::InputArgList &Args, ArrayRef<InputFile *> Files) {
   for (InputFile *File : Files)
     if (auto *F = dyn_cast<ArchiveFile>(File))
       if (All || Libs.count(path::filename(F->getName())))
-        for (Symbol *Sym : F->getSymbols())
-          Sym->VersionId = VER_NDX_LOCAL;
+        for (SymbolBody *Sym : F->getSymbols())
+          Sym->symbol()->VersionId = VER_NDX_LOCAL;
 }
 
 // Do actual linking. Note that when this function is called,
 // all linker scripts have already been parsed.
 template <class ELFT> void LinkerDriver::link(opt::InputArgList &Args) {
-  SymbolTable<ELFT> Symtab;
-  elf::Symtab<ELFT>::X = &Symtab;
   Target = getTarget();
 
   Config->MaxPageSize = getMaxPageSize(Args);
@@ -977,64 +1010,73 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &Args) {
 
   // Handle --trace-symbol.
   for (auto *Arg : Args.filtered(OPT_trace_symbol))
-    Symtab.trace(Arg->getValue());
+    Symtab->trace(Arg->getValue());
 
   // Add all files to the symbol table. This will add almost all
   // symbols that we need to the symbol table.
   for (InputFile *F : Files)
-    Symtab.addFile(F);
+    Symtab->addFile<ELFT>(F);
+
+  // Now that we have every file, we can decide if we will need a
+  // dynamic symbol table.
+  // We need one if we were asked to export dynamic symbols or if we are
+  // producing a shared library.
+  // We also need one if any shared libraries are used and for pie executables
+  // (probably because the dynamic linker needs it).
+  Config->HasDynSymTab =
+      !SharedFiles.empty() || Config->Pic || Config->ExportDynamic;
+
+  // Some symbols (such as __ehdr_start) are defined lazily only when there
+  // are undefined symbols for them, so we add these to trigger that logic.
+  for (StringRef Sym : Script->Opt.ReferencedSymbols)
+    Symtab->addUndefined<ELFT>(Sym);
 
   // If an entry symbol is in a static archive, pull out that file now
   // to complete the symbol table. After this, no new names except a
   // few linker-synthesized ones will be added to the symbol table.
-  if (Symtab.find(Config->Entry))
-    Symtab.addUndefined(Config->Entry);
+  if (Symtab->find(Config->Entry))
+    Symtab->addUndefined<ELFT>(Config->Entry);
 
   // Return if there were name resolution errors.
   if (ErrorCount)
     return;
 
   // Handle the `--undefined <sym>` options.
-  Symtab.scanUndefinedFlags();
+  Symtab->scanUndefinedFlags<ELFT>();
 
   // Handle undefined symbols in DSOs.
-  Symtab.scanShlibUndefined();
+  Symtab->scanShlibUndefined<ELFT>();
 
   // Handle the -exclude-libs option.
   if (Args.hasArg(OPT_exclude_libs))
     excludeLibs(Args, Files);
 
   // Apply version scripts.
-  Symtab.scanVersionScript();
+  Symtab->scanVersionScript();
 
   // Create wrapped symbols for -wrap option.
   for (auto *Arg : Args.filtered(OPT_wrap))
-    Symtab.addSymbolWrap(Arg->getValue());
+    Symtab->addSymbolWrap<ELFT>(Arg->getValue());
 
   // Create alias symbols for -defsym option.
   for (std::pair<StringRef, StringRef> &Def : getDefsym(Args))
-    Symtab.addSymbolAlias(Def.first, Def.second);
+    Symtab->addSymbolAlias<ELFT>(Def.first, Def.second);
 
-  Symtab.addCombinedLTOObject();
+  Symtab->addCombinedLTOObject<ELFT>();
   if (ErrorCount)
     return;
 
-  // Some symbols (such as __ehdr_start) are defined lazily only when there
-  // are undefined symbols for them, so we add these to trigger that logic.
-  for (StringRef Sym : Script->Opt.ReferencedSymbols)
-    Symtab.addUndefined(Sym);
-
   // Apply symbol renames for -wrap and -defsym
-  Symtab.applySymbolRenames();
+  Symtab->applySymbolRenames();
 
   // Now that we have a complete list of input files.
   // Beyond this point, no new files are added.
   // Aggregate all input sections into one place.
-  for (elf::ObjectFile<ELFT> *F : Symtab.getObjectFiles())
+  for (InputFile *F : ObjectFiles)
     for (InputSectionBase *S : F->getSections())
       if (S && S != &InputSection::Discarded)
         InputSections.push_back(S);
-  for (BinaryFile *F : Symtab.getBinaryFiles())
+  for (BinaryFile *F : BinaryFiles)
     for (InputSectionBase *S : F->getSections())
       InputSections.push_back(cast<InputSection>(S));
 

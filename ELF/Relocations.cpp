@@ -73,7 +73,7 @@ template <class ELFT>
 static std::string getLocation(InputSectionBase &S, const SymbolBody &Sym,
                                uint64_t Off) {
   std::string Msg =
-      "\n>>> defined in " + toString(Sym.File) + "\n>>> referenced by ";
+      "\n>>> defined in " + toString(Sym.getFile()) + "\n>>> referenced by ";
   std::string Src = S.getSrcMsg<ELFT>(Off);
   if (!Src.empty())
     Msg += Src + "\n>>>               ";
@@ -91,8 +91,12 @@ static bool isPreemptible(const SymbolBody &Body, uint32_t Type) {
   // relocation types occupy eight bit. In case of N64 ABI we extract first
   // relocation from 3-in-1 packet because only the first relocation can
   // be against a real symbol.
-  if (Config->EMachine == EM_MIPS && (Type & 0xff) == R_MIPS_GPREL16)
-    return false;
+  if (Config->EMachine == EM_MIPS) {
+    Type &= 0xff;
+    if (Type == R_MIPS_GPREL16 || Type == R_MICROMIPS_GPREL16 ||
+        Type == R_MICROMIPS_GPREL7_S2)
+      return false;
+  }
   return Body.isPreemptible();
 }
 
@@ -149,7 +153,7 @@ static unsigned handleARMTlsRelocation(uint32_t Type, SymbolBody &Body,
                                        InputSectionBase &C, uint64_t Offset,
                                        int64_t Addend, RelExpr Expr) {
   // The Dynamic TLS Module Index Relocation for a symbol defined in an
-  // executable is always 1. If the target Symbol is not preemtible then
+  // executable is always 1. If the target Symbol is not preemptible then
   // we know the offset into the TLS block at static link time.
   bool NeedDynId = Body.isPreemptible() || Config->Shared;
   bool NeedDynOff = Body.isPreemptible();
@@ -276,7 +280,7 @@ handleTlsRelocation(uint32_t Type, SymbolBody &Body, InputSectionBase &C,
     } else {
       C.Relocations.push_back(
           {Target->adjustRelaxExpr(Type, nullptr, R_RELAX_TLS_GD_TO_LE), Type,
-                Offset, Addend, &Body});
+           Offset, Addend, &Body});
     }
     return Target->TlsGdRelaxSkip;
   }
@@ -301,6 +305,8 @@ static uint32_t getMipsPairType(uint32_t Type, const SymbolBody &Sym) {
     return R_MIPS_LO16;
   case R_MIPS_GOT16:
     return Sym.isLocal() ? R_MIPS_LO16 : R_MIPS_NONE;
+  case R_MICROMIPS_GOT16:
+    return Sym.isLocal() ? R_MICROMIPS_LO16 : R_MIPS_NONE;
   case R_MIPS_PCHI16:
     return R_MIPS_PCLO16;
   case R_MICROMIPS_HI16:
@@ -313,8 +319,8 @@ static uint32_t getMipsPairType(uint32_t Type, const SymbolBody &Sym) {
 // True if non-preemptable symbol always has the same value regardless of where
 // the DSO is loaded.
 static bool isAbsolute(const SymbolBody &Body) {
-  if (Body.isUndefined())
-    return !Body.isLocal() && Body.symbol()->isWeak();
+  if (Body.isUndefWeak())
+    return true;
   if (const auto *DR = dyn_cast<DefinedRegular>(&Body))
     return DR->Section == nullptr; // Absolute symbol.
   return false;
@@ -396,7 +402,7 @@ static bool isStaticLinkTimeConstant(RelExpr E, uint32_t Type,
   // between start of a function and '_gp' value and defined as absolute just
   // to simplify the code.
   assert(AbsVal && RelE);
-  if (Body.isUndefined() && !Body.isLocal() && Body.symbol()->isWeak())
+  if (Body.isUndefWeak())
     return true;
 
   error("relocation " + toString(Type) + " cannot refer to absolute symbol: " +
@@ -434,7 +440,7 @@ template <class ELFT> static bool isReadOnly(SharedSymbol *SS) {
   uint64_t Value = SS->getValue<ELFT>();
 
   // Determine if the symbol is read-only by scanning the DSO's program headers.
-  auto *File = cast<SharedFile<ELFT>>(SS->File);
+  const SharedFile<ELFT> *File = SS->getFile<ELFT>();
   for (const Elf_Phdr &Phdr : check(File->getObj().program_headers()))
     if ((Phdr.p_type == ELF::PT_LOAD || Phdr.p_type == ELF::PT_GNU_RELRO) &&
         !(Phdr.p_flags & ELF::PF_W) && Value >= Phdr.p_vaddr &&
@@ -452,16 +458,16 @@ template <class ELFT>
 static std::vector<SharedSymbol *> getSymbolsAt(SharedSymbol *SS) {
   typedef typename ELFT::Sym Elf_Sym;
 
-  auto *File = cast<SharedFile<ELFT>>(SS->File);
+  SharedFile<ELFT> *File = SS->getFile<ELFT>();
   uint64_t Shndx = SS->getShndx<ELFT>();
   uint64_t Value = SS->getValue<ELFT>();
 
   std::vector<SharedSymbol *> Ret;
-  for (const Elf_Sym &S : File->getGlobalSymbols()) {
+  for (const Elf_Sym &S : File->getGlobalELFSyms()) {
     if (S.st_shndx != Shndx || S.st_value != Value)
       continue;
     StringRef Name = check(S.getName(File->getStringTable()));
-    SymbolBody *Sym = Symtab<ELFT>::X->find(Name);
+    SymbolBody *Sym = Symtab->find(Name);
     if (auto *Alias = dyn_cast_or_null<SharedSymbol>(Sym))
       Ret.push_back(Alias);
   }
@@ -519,20 +525,30 @@ template <class ELFT> static void addCopyRelSymbol(SharedSymbol *SS) {
   // See if this symbol is in a read-only segment. If so, preserve the symbol's
   // memory protection by reserving space in the .bss.rel.ro section.
   bool IsReadOnly = isReadOnly<ELFT>(SS);
-  BssSection *Sec = IsReadOnly ? InX::BssRelRo : InX::Bss;
-  uint64_t Off = Sec->reserveSpace(SymSize, SS->getAlignment<ELFT>());
+  BssSection *Sec = make<BssSection>(IsReadOnly ? ".bss.rel.ro" : ".bss");
+  Sec->reserveSpace(SymSize, SS->getAlignment<ELFT>());
+  if (IsReadOnly)
+    InX::BssRelRo->getParent()->addSection(Sec);
+  else
+    InX::Bss->getParent()->addSection(Sec);
 
   // Look through the DSO's dynamic symbol table for aliases and create a
   // dynamic symbol for each one. This causes the copy relocation to correctly
   // interpose any aliases.
   for (SharedSymbol *Sym : getSymbolsAt<ELFT>(SS)) {
-    Sym->NeedsCopy = true;
     Sym->CopyRelSec = Sec;
-    Sym->CopyRelSecOff = Off;
+    Sym->IsPreemptible = false;
     Sym->symbol()->IsUsedInRegularObj = true;
   }
 
-  In<ELFT>::RelaDyn->addReloc({Target->CopyRel, Sec, Off, false, SS, 0});
+  In<ELFT>::RelaDyn->addReloc({Target->CopyRel, Sec, 0, false, SS, 0});
+}
+
+static void errorOrWarn(const Twine &Msg) {
+  if (!Config->NoinhibitExec)
+    error(Msg);
+  else
+    warn(Msg);
 }
 
 template <class ELFT>
@@ -552,14 +568,24 @@ static RelExpr adjustExpr(SymbolBody &Body, RelExpr Expr, uint32_t Type,
   if (IsWrite || isStaticLinkTimeConstant<ELFT>(Expr, Type, Body, S, RelOff))
     return Expr;
 
-  // This relocation would require the dynamic linker to write a value to read
-  // only memory. We can hack around it if we are producing an executable and
+  // If we got here we know that this relocation would require the dynamic
+  // linker to write a value to read only memory.
+
+  // If the relocation is to a weak undef, give up on it and produce a
+  // non preemptible 0.
+  if (Body.isUndefWeak()) {
+    Body.IsPreemptible = false;
+    return Expr;
+  }
+
+  // We can hack around it if we are producing an executable and
   // the refered symbol can be preemepted to refer to the executable.
   if (Config->Shared || (Config->Pic && !isRelExpr(Expr))) {
     error("can't create dynamic relocation " + toString(Type) + " against " +
           (Body.getName().empty() ? "local symbol"
                                   : "symbol: " + toString(Body)) +
-          " in readonly segment" + getLocation<ELFT>(S, Body, RelOff));
+          " in readonly segment; recompile object files with -fPIC" +
+          getLocation<ELFT>(S, Body, RelOff));
     return Expr;
   }
 
@@ -572,7 +598,7 @@ static RelExpr adjustExpr(SymbolBody &Body, RelExpr Expr, uint32_t Type,
   if (Body.isObject()) {
     // Produce a copy relocation.
     auto *B = cast<SharedSymbol>(&Body);
-    if (!B->NeedsCopy) {
+    if (!B->CopyRelSec) {
       if (Config->ZNocopyreloc)
         error("unresolvable relocation " + toString(Type) +
               " against symbol '" + toString(*B) +
@@ -606,11 +632,12 @@ static RelExpr adjustExpr(SymbolBody &Body, RelExpr Expr, uint32_t Type,
     // plt. That is identified by special relocation types (R_X86_64_JUMP_SLOT,
     // R_386_JMP_SLOT, etc).
     Body.NeedsPltAddr = true;
+    Body.IsPreemptible = false;
     return toPlt(Expr);
   }
 
-  error("symbol '" + toString(Body) + "' defined in " + toString(Body.File) +
-        " has no type");
+  errorOrWarn("symbol '" + toString(Body) + "' defined in " +
+              toString(Body.getFile()) + " has no type");
   return Expr;
 }
 
@@ -661,10 +688,7 @@ static int64_t computeMipsAddend(const RelTy &Rel, InputSectionBase &Sec,
     if (RI->getSymbol(Config->IsMips64EL) != SymIndex)
       continue;
 
-    endianness E = Config->Endianness;
-    int32_t Hi = (read32(Buf + Rel.r_offset, E) & 0xffff) << 16;
-    int32_t Lo = SignExtend32<16>(read32(Buf + RI->r_offset, E));
-    return Hi + Lo;
+    return Target->getImplicitAddend(Buf + RI->r_offset, PairTy);
   }
 
   warn("can't find matching " + toString(PairTy) + " relocation for " +
@@ -691,12 +715,10 @@ static void reportUndefined(SymbolBody &Sym, InputSectionBase &S,
     Msg += Src + "\n>>>               ";
   Msg += S.getObjMsg<ELFT>(Offset);
 
-  if (Config->UnresolvedSymbols == UnresolvedPolicy::WarnAll ||
-      (Config->UnresolvedSymbols == UnresolvedPolicy::Warn && CanBeExternal)) {
+  if (Config->UnresolvedSymbols == UnresolvedPolicy::Warn && CanBeExternal)
     warn(Msg);
-  } else {
-    error(Msg);
-  }
+  else
+    errorOrWarn(Msg);
 }
 
 template <class RelTy>
@@ -743,7 +765,7 @@ public:
     if (P.empty())
       return Off;
 
-    while (I != Size && P[I].InputOff + P[I].size() <= Off)
+    while (I != Size && P[I].InputOff + P[I].Size <= Off)
       ++I;
     if (I == Size)
       return Off;
@@ -840,8 +862,8 @@ static void scanRelocs(InputSectionBase &Sec, ArrayRef<RelTy> Rels) {
     if (!Body.isLocal() && Body.isUndefined() && !Body.symbol()->isWeak())
       reportUndefined<ELFT>(Body, Sec, Rel.r_offset);
 
-    RelExpr Expr =
-        Target->getRelExpr(Type, Body, Sec.Data.begin() + Rel.r_offset);
+    RelExpr Expr = Target->getRelExpr(Type, Body, *Sec.File,
+                                      Sec.Data.begin() + Rel.r_offset);
 
     // Ignore "hint" relocations because they are only markers for relaxation.
     if (isRelExprOneOf<R_HINT, R_NONE>(Expr))
@@ -905,9 +927,10 @@ static void scanRelocs(InputSectionBase &Sec, ArrayRef<RelTy> Rels) {
       // We don't know anything about the finaly symbol. Just ask the dynamic
       // linker to handle the relocation for us.
       if (!Target->isPicRel(Type))
-        error("relocation " + toString(Type) +
-              " cannot be used against shared object; recompile with -fPIC" +
-              getLocation<ELFT>(Sec, Body, Offset));
+        errorOrWarn(
+            "relocation " + toString(Type) +
+            " cannot be used against shared object; recompile with -fPIC" +
+            getLocation<ELFT>(Sec, Body, Offset));
 
       In<ELFT>::RelaDyn->addReloc(
           {Target->getDynRel(Type), &Sec, Offset, false, &Body, Addend});
@@ -1000,31 +1023,37 @@ void ThunkCreator::mergeThunks() {
   }
 }
 
+static uint32_t findEndOfFirstNonExec(OutputSection &Cmd) {
+  for (BaseCommand *Base : Cmd.Commands)
+    if (auto *ISD = dyn_cast<InputSectionDescription>(Base))
+      for (auto *IS : ISD->Sections)
+        if ((IS->Flags & SHF_EXECINSTR) == 0)
+          return IS->OutSecOff + IS->getSize();
+  return 0;
+}
+
 ThunkSection *ThunkCreator::getOSThunkSec(OutputSection *OS,
                                           std::vector<InputSection *> *ISR) {
   if (CurTS == nullptr) {
-    uint32_t Off = 0;
-    for (auto *IS : OS->Sections) {
-      Off = IS->OutSecOff + IS->getSize();
-      if ((IS->Flags & SHF_EXECINSTR) == 0)
-        break;
-    }
+    uint32_t Off = findEndOfFirstNonExec(*OS);
     CurTS = addThunkSection(OS, ISR, Off);
   }
   return CurTS;
 }
 
-ThunkSection *ThunkCreator::getISThunkSec(InputSection *IS, OutputSection *OS) {
+// Add a Thunk that needs to be placed in a ThunkSection that immediately
+// precedes its Target.
+ThunkSection *ThunkCreator::getISThunkSec(InputSection *IS) {
   ThunkSection *TS = ThunkedSections.lookup(IS);
   if (TS)
     return TS;
-  auto *TOS = IS->getParent();
 
-  // Find InputSectionRange within TOS that IS is in
-  OutputSectionCommand *C = Script->getCmd(TOS);
+  // Find InputSectionRange within Target Output Section (TOS) that the
+  // InputSection (IS) that we need to precede is in.
+  OutputSection *TOS = IS->getParent();
   std::vector<InputSection *> *Range = nullptr;
-  for (BaseCommand *BC : C->Commands)
-    if (auto *ISD = dyn_cast<InputSectionDescription> (BC)) {
+  for (BaseCommand *BC : TOS->Commands)
+    if (auto *ISD = dyn_cast<InputSectionDescription>(BC)) {
       InputSection *first = ISD->Sections.front();
       InputSection *last = ISD->Sections.back();
       if (IS->OutSecOff >= first->OutSecOff &&
@@ -1046,7 +1075,6 @@ ThunkSection *ThunkCreator::addThunkSection(OutputSection *OS,
   return TS;
 }
 
-
 std::pair<Thunk *, bool> ThunkCreator::getThunk(SymbolBody &Body,
                                                 uint32_t Type) {
   auto Res = ThunkedSymbols.insert({&Body, std::vector<Thunk *>()});
@@ -1065,21 +1093,19 @@ std::pair<Thunk *, bool> ThunkCreator::getThunk(SymbolBody &Body,
 // Call Fn on every executable InputSection accessed via the linker script
 // InputSectionDescription::Sections.
 void ThunkCreator::forEachExecInputSection(
-    ArrayRef<OutputSectionCommand *> OutputSections,
+    ArrayRef<OutputSection *> OutputSections,
     std::function<void(OutputSection *, std::vector<InputSection *> *,
                        InputSection *)>
         Fn) {
-  for (OutputSectionCommand *Cmd : OutputSections) {
-    OutputSection *OS = Cmd->Sec;
+  for (OutputSection *OS : OutputSections) {
     if (!(OS->Flags & SHF_ALLOC) || !(OS->Flags & SHF_EXECINSTR))
       continue;
-    if (OutputSectionCommand *C = Script->getCmd(OS))
-      for (BaseCommand *BC : C->Commands)
-        if (auto *ISD = dyn_cast<InputSectionDescription>(BC)) {
-          CurTS = nullptr;
-          for (InputSection* IS : ISD->Sections)
-            Fn(OS, &ISD->Sections, IS);
-        }
+    for (BaseCommand *BC : OS->Commands)
+      if (auto *ISD = dyn_cast<InputSectionDescription>(BC)) {
+        CurTS = nullptr;
+        for (InputSection *IS : ISD->Sections)
+          Fn(OS, &ISD->Sections, IS);
+      }
   }
 }
 
@@ -1093,8 +1119,7 @@ void ThunkCreator::forEachExecInputSection(
 //
 // FIXME: All Thunks are assumed to be in range of the relocation. Range
 // extension Thunks are not yet supported.
-bool ThunkCreator::createThunks(
-    ArrayRef<OutputSectionCommand *> OutputSections) {
+bool ThunkCreator::createThunks(ArrayRef<OutputSection *> OutputSections) {
   if (Pass > 0)
     ThunkSections.clear();
 
@@ -1104,32 +1129,32 @@ bool ThunkCreator::createThunks(
   // We separate the creation of ThunkSections from the insertion of the
   // ThunkSections back into the OutputSection as ThunkSections are not always
   // inserted into the same OutputSection as the caller.
-  forEachExecInputSection(
-      OutputSections, [&](OutputSection *OS,  std::vector<InputSection*> *ISR,
-                          InputSection *IS) {
-        for (Relocation &Rel : IS->Relocations) {
-          SymbolBody &Body = *Rel.Sym;
-          if (Thunks.find(&Body) != Thunks.end() ||
-              !Target->needsThunk(Rel.Expr, Rel.Type, IS->File, Body))
-            continue;
-          Thunk *T;
-          bool IsNew;
-          std::tie(T, IsNew) = getThunk(Body, Rel.Type);
-          if (IsNew) {
-            // Find or create a ThunkSection for the new Thunk
-            ThunkSection *TS;
-            if (auto *TIS = T->getTargetInputSection())
-              TS = getISThunkSec(TIS, OS);
-            else
-              TS = getOSThunkSec(OS, ISR);
-            TS->addThunk(T);
-            Thunks[T->ThunkSym] = T;
-          }
-          // Redirect relocation to Thunk, we never go via the PLT to a Thunk
-          Rel.Sym = T->ThunkSym;
-          Rel.Expr = fromPlt(Rel.Expr);
-        }
-      });
+  forEachExecInputSection(OutputSections, [&](OutputSection *OS,
+                                              std::vector<InputSection *> *ISR,
+                                              InputSection *IS) {
+    for (Relocation &Rel : IS->Relocations) {
+      SymbolBody &Body = *Rel.Sym;
+      if (Thunks.find(&Body) != Thunks.end() ||
+          !Target->needsThunk(Rel.Expr, Rel.Type, IS->File, Body))
+        continue;
+      Thunk *T;
+      bool IsNew;
+      std::tie(T, IsNew) = getThunk(Body, Rel.Type);
+      if (IsNew) {
+        // Find or create a ThunkSection for the new Thunk
+        ThunkSection *TS;
+        if (auto *TIS = T->getTargetInputSection())
+          TS = getISThunkSec(TIS);
+        else
+          TS = getOSThunkSec(OS, ISR);
+        TS->addThunk(T);
+        Thunks[T->ThunkSym] = T;
+      }
+      // Redirect relocation to Thunk, we never go via the PLT to a Thunk
+      Rel.Sym = T->ThunkSym;
+      Rel.Expr = fromPlt(Rel.Expr);
+    }
+  });
   // Merge all created synthetic ThunkSections back into OutputSection
   mergeThunks();
   ++Pass;

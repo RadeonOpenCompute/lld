@@ -48,7 +48,7 @@ static std::string indent(int Depth) { return std::string(Depth * 8, ' '); }
 // Returns a list of all symbols that we want to print out.
 static std::vector<DefinedRegular *> getSymbols() {
   std::vector<DefinedRegular *> V;
-  for (coff::ObjectFile *File : Symtab->ObjectFiles)
+  for (ObjFile *File : ObjFile::Instances)
     for (SymbolBody *B : File->getSymbols())
       if (auto *Sym = dyn_cast<DefinedRegular>(B))
         if (Sym && !Sym->getCOFFSymbol().isSectionDefinition())
@@ -115,7 +115,7 @@ void coff::writeMapFile(ArrayRef<OutputSection *> OutputSections) {
       if (!SC)
         continue;
 
-      writeHeader(OS, SC->getRVA(), SC->getSize(), SC->getAlign());
+      writeHeader(OS, SC->getRVA(), SC->getSize(), SC->Alignment);
       OS << indent(1) << SC->File->getName() << ":(" << SC->getSectionName()
          << ")\n";
       for (DefinedRegular *Sym : SectionSyms[SC])
