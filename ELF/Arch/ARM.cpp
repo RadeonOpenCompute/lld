@@ -26,7 +26,7 @@ namespace {
 class ARM final : public TargetInfo {
 public:
   ARM();
-  RelExpr getRelExpr(uint32_t Type, const SymbolBody &S,
+  RelExpr getRelExpr(uint32_t Type, const SymbolBody &S, const InputFile &File,
                      const uint8_t *Loc) const override;
   bool isPicRel(uint32_t Type) const override;
   uint32_t getDynRel(uint32_t Type) const override;
@@ -40,6 +40,8 @@ public:
   void addPltHeaderSymbols(InputSectionBase *ISD) const override;
   bool needsThunk(RelExpr Expr, uint32_t RelocType, const InputFile *File,
                   const SymbolBody &S) const override;
+  bool inBranchRange(uint32_t RelocType, uint64_t Src,
+                     uint64_t Dst) const override;
   void relocateOne(uint8_t *Loc, uint32_t Type, uint64_t Val) const override;
 };
 } // namespace
@@ -64,7 +66,7 @@ ARM::ARM() {
 }
 
 RelExpr ARM::getRelExpr(uint32_t Type, const SymbolBody &S,
-                        const uint8_t *Loc) const {
+                        const InputFile &File, const uint8_t *Loc) const {
   switch (Type) {
   default:
     return R_ABS;
@@ -192,8 +194,7 @@ bool ARM::needsThunk(RelExpr Expr, uint32_t RelocType, const InputFile *File,
   // If S is an undefined weak symbol in an executable we don't need a Thunk.
   // In a DSO calls to undefined symbols, including weak ones get PLT entries
   // which may need a thunk.
-  if (S.isUndefined() && !S.isLocal() && S.symbol()->isWeak() &&
-      !Config->Shared)
+  if (S.isUndefWeak() && !Config->Shared)
     return false;
   // A state change from ARM to Thumb and vice versa must go through an
   // interworking thunk if the relocation type is not R_ARM_CALL or
@@ -216,6 +217,49 @@ bool ARM::needsThunk(RelExpr Expr, uint32_t RelocType, const InputFile *File,
     break;
   }
   return false;
+}
+
+bool ARM::inBranchRange(uint32_t RelocType, uint64_t Src, uint64_t Dst) const {
+  uint64_t Range;
+  uint64_t InstrSize;
+
+  switch (RelocType) {
+  case R_ARM_PC24:
+  case R_ARM_PLT32:
+  case R_ARM_JUMP24:
+  case R_ARM_CALL:
+    Range = 0x2000000;
+    InstrSize = 4;
+    break;
+  case R_ARM_THM_JUMP19:
+    Range = 0x100000;
+    InstrSize = 2;
+    break;
+  case R_ARM_THM_JUMP24:
+  case R_ARM_THM_CALL:
+    Range = 0x1000000;
+    InstrSize = 2;
+    break;
+  default:
+    return true;
+  }
+  // PC at Src is 2 instructions ahead, immediate of branch is signed
+  if (Src > Dst)
+    Range -= 2 * InstrSize;
+  else
+    Range += InstrSize;
+
+  if ((Dst & 0x1) == 0)
+    // Destination is ARM, if ARM caller then Src is already 4-byte aligned.
+    // If Thumb Caller (BLX) the Src address has bottom 2 bits cleared to ensure
+    // destination will be 4 byte aligned.
+    Src &= ~0x3;
+  else
+    // Bit 0 == 1 denotes Thumb state, it is not part of the range
+    Dst &= ~0x1;
+
+  uint64_t Distance = (Src > Dst) ? Src - Dst : Dst - Src;
+  return Distance <= Range;
 }
 
 void ARM::relocateOne(uint8_t *Loc, uint32_t Type, uint64_t Val) const {

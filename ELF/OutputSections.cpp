@@ -17,6 +17,7 @@
 #include "Target.h"
 #include "Threads.h"
 #include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/Support/Compression.h"
 #include "llvm/Support/MD5.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/SHA1.h"
@@ -42,7 +43,6 @@ OutputSection *Out::InitArray;
 OutputSection *Out::FiniArray;
 
 std::vector<OutputSection *> elf::OutputSections;
-std::vector<OutputSectionCommand *> elf::OutputSectionCommands;
 
 uint32_t OutputSection::getPhdrFlags() const {
   uint32_t Ret = PF_R;
@@ -68,10 +68,13 @@ void OutputSection::writeHeaderTo(typename ELFT::Shdr *Shdr) {
 }
 
 OutputSection::OutputSection(StringRef Name, uint32_t Type, uint64_t Flags)
-    : SectionBase(Output, Name, Flags, /*Entsize*/ 0, /*Alignment*/ 1, Type,
+    : BaseCommand(OutputSectionKind),
+      SectionBase(Output, Name, Flags, /*Entsize*/ 0, /*Alignment*/ 1, Type,
                   /*Info*/ 0,
                   /*Link*/ 0),
-      SectionIndex(INT_MAX) {}
+      SectionIndex(INT_MAX) {
+  Live = false;
+}
 
 static uint64_t updateOffset(uint64_t Off, InputSection *S) {
   Off = alignTo(Off, S->Alignment);
@@ -81,7 +84,7 @@ static uint64_t updateOffset(uint64_t Off, InputSection *S) {
 
 void OutputSection::addSection(InputSection *S) {
   assert(S->Live);
-  Sections.push_back(S);
+  Live = true;
   S->Parent = this;
   this->updateAlignment(S->Alignment);
 
@@ -99,42 +102,395 @@ void OutputSection::addSection(InputSection *S) {
   // Probably we sholuld handle that as an error. But for now we just
   // pick the largest sh_entsize.
   this->Entsize = std::max(this->Entsize, S->Entsize);
+
+  if (!S->Assigned) {
+    S->Assigned = true;
+    if (Commands.empty() || !isa<InputSectionDescription>(Commands.back()))
+      Commands.push_back(make<InputSectionDescription>(""));
+    auto *ISD = cast<InputSectionDescription>(Commands.back());
+    ISD->Sections.push_back(S);
+  }
 }
 
-// This function is called after we sort input sections
-// and scan relocations to setup sections' offsets.
-void OutputSection::assignOffsets() {
-  OutputSectionCommand *Cmd = Script->getCmd(this);
-  uint64_t Off = 0;
-  for (BaseCommand *Base : Cmd->Commands)
-    if (auto *ISD = dyn_cast<InputSectionDescription>(Base))
-      for (InputSection *S : ISD->Sections)
-        Off = updateOffset(Off, S);
-  this->Size = Off;
+static SectionKey createKey(InputSectionBase *C, StringRef OutsecName) {
+  //  The ELF spec just says
+  // ----------------------------------------------------------------
+  // In the first phase, input sections that match in name, type and
+  // attribute flags should be concatenated into single sections.
+  // ----------------------------------------------------------------
+  //
+  // However, it is clear that at least some flags have to be ignored for
+  // section merging. At the very least SHF_GROUP and SHF_COMPRESSED have to be
+  // ignored. We should not have two output .text sections just because one was
+  // in a group and another was not for example.
+  //
+  // It also seems that that wording was a late addition and didn't get the
+  // necessary scrutiny.
+  //
+  // Merging sections with different flags is expected by some users. One
+  // reason is that if one file has
+  //
+  // int *const bar __attribute__((section(".foo"))) = (int *)0;
+  //
+  // gcc with -fPIC will produce a read only .foo section. But if another
+  // file has
+  //
+  // int zed;
+  // int *const bar __attribute__((section(".foo"))) = (int *)&zed;
+  //
+  // gcc with -fPIC will produce a read write section.
+  //
+  // Last but not least, when using linker script the merge rules are forced by
+  // the script. Unfortunately, linker scripts are name based. This means that
+  // expressions like *(.foo*) can refer to multiple input sections with
+  // different flags. We cannot put them in different output sections or we
+  // would produce wrong results for
+  //
+  // start = .; *(.foo.*) end = .; *(.bar)
+  //
+  // and a mapping of .foo1 and .bar1 to one section and .foo2 and .bar2 to
+  // another. The problem is that there is no way to layout those output
+  // sections such that the .foo sections are the only thing between the start
+  // and end symbols.
+  //
+  // Given the above issues, we instead merge sections by name and error on
+  // incompatible types and flags.
+
+  uint32_t Alignment = 0;
+  uint64_t Flags = 0;
+  if (Config->Relocatable && (C->Flags & SHF_MERGE)) {
+    Alignment = std::max<uint64_t>(C->Alignment, C->Entsize);
+    Flags = C->Flags & (SHF_MERGE | SHF_STRINGS);
+  }
+
+  return SectionKey{OutsecName, Flags, Alignment};
 }
 
-void OutputSection::sort(std::function<int(InputSectionBase *S)> Order) {
-  typedef std::pair<unsigned, InputSection *> Pair;
+OutputSectionFactory::OutputSectionFactory() {}
+
+static uint64_t getIncompatibleFlags(uint64_t Flags) {
+  return Flags & (SHF_ALLOC | SHF_TLS);
+}
+
+// We allow sections of types listed below to merged into a
+// single progbits section. This is typically done by linker
+// scripts. Merging nobits and progbits will force disk space
+// to be allocated for nobits sections. Other ones don't require
+// any special treatment on top of progbits, so there doesn't
+// seem to be a harm in merging them.
+static bool canMergeToProgbits(unsigned Type) {
+  return Type == SHT_NOBITS || Type == SHT_PROGBITS || Type == SHT_INIT_ARRAY ||
+         Type == SHT_PREINIT_ARRAY || Type == SHT_FINI_ARRAY ||
+         Type == SHT_NOTE;
+}
+
+void elf::sortByOrder(MutableArrayRef<InputSection *> In,
+                      std::function<int(InputSectionBase *S)> Order) {
+  typedef std::pair<int, InputSection *> Pair;
   auto Comp = [](const Pair &A, const Pair &B) { return A.first < B.first; };
 
   std::vector<Pair> V;
-  for (InputSection *S : Sections)
+  for (InputSection *S : In)
     V.push_back({Order(S), S});
   std::stable_sort(V.begin(), V.end(), Comp);
-  Sections.clear();
-  for (Pair &P : V)
-    Sections.push_back(P.second);
+
+  for (size_t I = 0; I < V.size(); ++I)
+    In[I] = V[I].second;
 }
 
-// Sorts input sections by section name suffixes, so that .foo.N comes
-// before .foo.M if N < M. Used to sort .{init,fini}_array.N sections.
-// We want to keep the original order if the priorities are the same
-// because the compiler keeps the original initialization order in a
-// translation unit and we need to respect that.
-// For more detail, read the section of the GCC's manual about init_priority.
-void OutputSection::sortInitFini() {
-  // Sort sections by priority.
-  sort([](InputSectionBase *S) { return getPriority(S->Name); });
+void elf::reportDiscarded(InputSectionBase *IS) {
+  if (!Config->PrintGcSections)
+    return;
+  message("removing unused section from '" + IS->Name + "' in file '" +
+          IS->File->getName() + "'");
+}
+
+static OutputSection *addSection(InputSectionBase *IS, StringRef OutsecName,
+                                 OutputSection *Sec) {
+  if (Sec && Sec->Live) {
+    if (getIncompatibleFlags(Sec->Flags) != getIncompatibleFlags(IS->Flags))
+      error("incompatible section flags for " + Sec->Name + "\n>>> " +
+            toString(IS) + ": 0x" + utohexstr(IS->Flags) +
+            "\n>>> output section " + Sec->Name + ": 0x" +
+            utohexstr(Sec->Flags));
+    if (Sec->Type != IS->Type) {
+      if (canMergeToProgbits(Sec->Type) && canMergeToProgbits(IS->Type))
+        Sec->Type = SHT_PROGBITS;
+      else
+        error("section type mismatch for " + IS->Name + "\n>>> " +
+              toString(IS) + ": " +
+              getELFSectionTypeName(Config->EMachine, IS->Type) +
+              "\n>>> output section " + Sec->Name + ": " +
+              getELFSectionTypeName(Config->EMachine, Sec->Type));
+    }
+    Sec->Flags |= IS->Flags;
+  } else {
+    if (!Sec) {
+      Sec = Script->createOutputSection(OutsecName, "<internal>");
+      Script->Opt.Commands.push_back(Sec);
+    }
+    Sec->Type = IS->Type;
+    Sec->Flags = IS->Flags;
+  }
+
+  Sec->addSection(cast<InputSection>(IS));
+  return Sec;
+}
+
+void OutputSectionFactory::addInputSec(InputSectionBase *IS,
+                                       StringRef OutsecName,
+                                       OutputSection *OS) {
+  if (!IS->Live) {
+    reportDiscarded(IS);
+    return;
+  }
+
+  // If we have destination output section - use it directly.
+  if (OS) {
+    addSection(IS, OutsecName, OS);
+    return;
+  }
+
+  // Sections with SHT_GROUP or SHF_GROUP attributes reach here only when the -r
+  // option is given. A section with SHT_GROUP defines a "section group", and
+  // its members have SHF_GROUP attribute. Usually these flags have already been
+  // stripped by InputFiles.cpp as section groups are processed and uniquified.
+  // However, for the -r option, we want to pass through all section groups
+  // as-is because adding/removing members or merging them with other groups
+  // change their semantics.
+  if (IS->Type == SHT_GROUP || (IS->Flags & SHF_GROUP)) {
+    addSection(IS, OutsecName, nullptr);
+    return;
+  }
+
+  // Imagine .zed : { *(.foo) *(.bar) } script. Both foo and bar may have
+  // relocation sections .rela.foo and .rela.bar for example. Most tools do
+  // not allow multiple REL[A] sections for output section. Hence we
+  // should combine these relocation sections into single output.
+  // We skip synthetic sections because it can be .rela.dyn/.rela.plt or any
+  // other REL[A] sections created by linker itself.
+  if (!isa<SyntheticSection>(IS) &&
+      (IS->Type == SHT_REL || IS->Type == SHT_RELA)) {
+    auto *Sec = cast<InputSection>(IS);
+    OutputSection *Out = Sec->getRelocatedSection()->getOutputSection();
+    Out->RelocationSection = addSection(IS, OutsecName, Out->RelocationSection);
+    return;
+  }
+
+  SectionKey Key = createKey(IS, OutsecName);
+  OutputSection *&Sec = Map[Key];
+  Sec = addSection(IS, OutsecName, Sec);
+}
+
+OutputSectionFactory::~OutputSectionFactory() {}
+
+SectionKey DenseMapInfo<SectionKey>::getEmptyKey() {
+  return SectionKey{DenseMapInfo<StringRef>::getEmptyKey(), 0, 0};
+}
+
+SectionKey DenseMapInfo<SectionKey>::getTombstoneKey() {
+  return SectionKey{DenseMapInfo<StringRef>::getTombstoneKey(), 0, 0};
+}
+
+unsigned DenseMapInfo<SectionKey>::getHashValue(const SectionKey &Val) {
+  return hash_combine(Val.Name, Val.Flags, Val.Alignment);
+}
+
+bool DenseMapInfo<SectionKey>::isEqual(const SectionKey &LHS,
+                                       const SectionKey &RHS) {
+  return DenseMapInfo<StringRef>::isEqual(LHS.Name, RHS.Name) &&
+         LHS.Flags == RHS.Flags && LHS.Alignment == RHS.Alignment;
+}
+
+uint64_t elf::getHeaderSize() {
+  if (Config->OFormatBinary)
+    return 0;
+  return Out::ElfHeader->Size + Out::ProgramHeaders->Size;
+}
+
+bool OutputSection::classof(const BaseCommand *C) {
+  return C->Kind == OutputSectionKind;
+}
+
+void OutputSection::sort(std::function<int(InputSectionBase *S)> Order) {
+  assert(Commands.size() == 1);
+  sortByOrder(cast<InputSectionDescription>(Commands[0])->Sections, Order);
+}
+
+// Fill [Buf, Buf + Size) with Filler.
+// This is used for linker script "=fillexp" command.
+static void fill(uint8_t *Buf, size_t Size, uint32_t Filler) {
+  size_t I = 0;
+  for (; I + 4 < Size; I += 4)
+    memcpy(Buf + I, &Filler, 4);
+  memcpy(Buf + I, &Filler, Size - I);
+}
+
+// Compress section contents if this section contains debug info.
+template <class ELFT> void OutputSection::maybeCompress() {
+  typedef typename ELFT::Chdr Elf_Chdr;
+
+  // Compress only DWARF debug sections.
+  if (!Config->CompressDebugSections || (Flags & SHF_ALLOC) ||
+      !Name.startswith(".debug_"))
+    return;
+
+  // Create a section header.
+  ZDebugHeader.resize(sizeof(Elf_Chdr));
+  auto *Hdr = reinterpret_cast<Elf_Chdr *>(ZDebugHeader.data());
+  Hdr->ch_type = ELFCOMPRESS_ZLIB;
+  Hdr->ch_size = Size;
+  Hdr->ch_addralign = Alignment;
+
+  // Write section contents to a temporary buffer and compress it.
+  std::vector<uint8_t> Buf(Size);
+  writeTo<ELFT>(Buf.data());
+  if (Error E = zlib::compress(toStringRef(Buf), CompressedData))
+    fatal("compress failed: " + llvm::toString(std::move(E)));
+
+  // Update section headers.
+  Size = sizeof(Elf_Chdr) + CompressedData.size();
+  Flags |= SHF_COMPRESSED;
+}
+
+static void writeInt(uint8_t *Buf, uint64_t Data, uint64_t Size) {
+  if (Size == 1)
+    *Buf = Data;
+  else if (Size == 2)
+    write16(Buf, Data, Config->Endianness);
+  else if (Size == 4)
+    write32(Buf, Data, Config->Endianness);
+  else if (Size == 8)
+    write64(Buf, Data, Config->Endianness);
+  else
+    llvm_unreachable("unsupported Size argument");
+}
+
+template <class ELFT> void OutputSection::writeTo(uint8_t *Buf) {
+  if (Type == SHT_NOBITS)
+    return;
+
+  Loc = Buf;
+
+  // If -compress-debug-section is specified and if this is a debug seciton,
+  // we've already compressed section contents. If that's the case,
+  // just write it down.
+  if (!CompressedData.empty()) {
+    memcpy(Buf, ZDebugHeader.data(), ZDebugHeader.size());
+    memcpy(Buf + ZDebugHeader.size(), CompressedData.data(),
+           CompressedData.size());
+    return;
+  }
+
+  // Write leading padding.
+  std::vector<InputSection *> Sections;
+  for (BaseCommand *Cmd : Commands)
+    if (auto *ISD = dyn_cast<InputSectionDescription>(Cmd))
+      for (InputSection *IS : ISD->Sections)
+        if (IS->Live)
+          Sections.push_back(IS);
+  uint32_t Filler = getFiller();
+  if (Filler)
+    fill(Buf, Sections.empty() ? Size : Sections[0]->OutSecOff, Filler);
+
+  parallelForEachN(0, Sections.size(), [=](size_t I) {
+    InputSection *IS = Sections[I];
+    IS->writeTo<ELFT>(Buf);
+
+    // Fill gaps between sections.
+    if (Filler) {
+      uint8_t *Start = Buf + IS->OutSecOff + IS->getSize();
+      uint8_t *End;
+      if (I + 1 == Sections.size())
+        End = Buf + Size;
+      else
+        End = Buf + Sections[I + 1]->OutSecOff;
+      fill(Start, End - Start, Filler);
+    }
+  });
+
+  // Linker scripts may have BYTE()-family commands with which you
+  // can write arbitrary bytes to the output. Process them if any.
+  for (BaseCommand *Base : Commands)
+    if (auto *Data = dyn_cast<BytesDataCommand>(Base))
+      writeInt(Buf + Data->Offset, Data->Expression().getValue(), Data->Size);
+}
+
+static bool compareByFilePosition(InputSection *A, InputSection *B) {
+  // Synthetic doesn't have link order dependecy, stable_sort will keep it last
+  if (A->kind() == InputSectionBase::Synthetic ||
+      B->kind() == InputSectionBase::Synthetic)
+    return false;
+  InputSection *LA = A->getLinkOrderDep();
+  InputSection *LB = B->getLinkOrderDep();
+  OutputSection *AOut = LA->getParent();
+  OutputSection *BOut = LB->getParent();
+  if (AOut != BOut)
+    return AOut->SectionIndex < BOut->SectionIndex;
+  return LA->OutSecOff < LB->OutSecOff;
+}
+
+template <class ELFT>
+static void finalizeShtGroup(OutputSection *OS,
+                             ArrayRef<InputSection *> Sections) {
+  assert(Config->Relocatable && Sections.size() == 1);
+
+  // sh_link field for SHT_GROUP sections should contain the section index of
+  // the symbol table.
+  OS->Link = InX::SymTab->getParent()->SectionIndex;
+
+  // sh_info then contain index of an entry in symbol table section which
+  // provides signature of the section group.
+  ObjFile<ELFT> *Obj = Sections[0]->getFile<ELFT>();
+  ArrayRef<SymbolBody *> Symbols = Obj->getSymbols();
+  OS->Info = InX::SymTab->getSymbolIndex(Symbols[Sections[0]->Info]);
+}
+
+template <class ELFT> void OutputSection::finalize() {
+  // Link order may be distributed across several InputSectionDescriptions
+  // but sort must consider them all at once.
+  std::vector<InputSection **> ScriptSections;
+  std::vector<InputSection *> Sections;
+  for (BaseCommand *Base : Commands) {
+    if (auto *ISD = dyn_cast<InputSectionDescription>(Base)) {
+      for (InputSection *&IS : ISD->Sections) {
+        ScriptSections.push_back(&IS);
+        Sections.push_back(IS);
+      }
+    }
+  }
+
+  if (Flags & SHF_LINK_ORDER) {
+    std::stable_sort(Sections.begin(), Sections.end(), compareByFilePosition);
+    for (int I = 0, N = Sections.size(); I < N; ++I)
+      *ScriptSections[I] = Sections[I];
+
+    // We must preserve the link order dependency of sections with the
+    // SHF_LINK_ORDER flag. The dependency is indicated by the sh_link field. We
+    // need to translate the InputSection sh_link to the OutputSection sh_link,
+    // all InputSections in the OutputSection have the same dependency.
+    if (auto *D = Sections.front()->getLinkOrderDep())
+      Link = D->getParent()->SectionIndex;
+  }
+
+  if (Type == SHT_GROUP) {
+    finalizeShtGroup<ELFT>(this, Sections);
+    return;
+  }
+
+  if (!Config->CopyRelocs || (Type != SHT_RELA && Type != SHT_REL))
+    return;
+
+  InputSection *First = Sections[0];
+  if (isa<SyntheticSection>(First))
+    return;
+
+  Link = InX::SymTab->getParent()->SectionIndex;
+  // sh_info for SHT_REL[A] sections should contain the section header index of
+  // the section to which the relocation applies.
+  InputSectionBase *S = First->getRelocatedSection();
+  Info = S->getOutputSection()->SectionIndex;
+  Flags |= SHF_INFO_LINK;
 }
 
 // Returns true if S matches /Filename.?\.o$/.
@@ -192,182 +548,59 @@ static bool compCtors(const InputSection *A, const InputSection *B) {
 // Unfortunately, the rules are different from the one for .{init,fini}_array.
 // Read the comment above.
 void OutputSection::sortCtorsDtors() {
-  std::stable_sort(Sections.begin(), Sections.end(), compCtors);
+  assert(Commands.size() == 1);
+  auto *ISD = cast<InputSectionDescription>(Commands[0]);
+  std::stable_sort(ISD->Sections.begin(), ISD->Sections.end(), compCtors);
 }
 
-static SectionKey createKey(InputSectionBase *C, StringRef OutsecName) {
-  //  The ELF spec just says
-  // ----------------------------------------------------------------
-  // In the first phase, input sections that match in name, type and
-  // attribute flags should be concatenated into single sections.
-  // ----------------------------------------------------------------
-  //
-  // However, it is clear that at least some flags have to be ignored for
-  // section merging. At the very least SHF_GROUP and SHF_COMPRESSED have to be
-  // ignored. We should not have two output .text sections just because one was
-  // in a group and another was not for example.
-  //
-  // It also seems that that wording was a late addition and didn't get the
-  // necessary scrutiny.
-  //
-  // Merging sections with different flags is expected by some users. One
-  // reason is that if one file has
-  //
-  // int *const bar __attribute__((section(".foo"))) = (int *)0;
-  //
-  // gcc with -fPIC will produce a read only .foo section. But if another
-  // file has
-  //
-  // int zed;
-  // int *const bar __attribute__((section(".foo"))) = (int *)&zed;
-  //
-  // gcc with -fPIC will produce a read write section.
-  //
-  // Last but not least, when using linker script the merge rules are forced by
-  // the script. Unfortunately, linker scripts are name based. This means that
-  // expressions like *(.foo*) can refer to multiple input sections with
-  // different flags. We cannot put them in different output sections or we
-  // would produce wrong results for
-  //
-  // start = .; *(.foo.*) end = .; *(.bar)
-  //
-  // and a mapping of .foo1 and .bar1 to one section and .foo2 and .bar2 to
-  // another. The problem is that there is no way to layout those output
-  // sections such that the .foo sections are the only thing between the start
-  // and end symbols.
-  //
-  // Given the above issues, we instead merge sections by name and error on
-  // incompatible types and flags.
-
-  uint32_t Alignment = 0;
-  uint64_t Flags = 0;
-  if (Config->Relocatable && (C->Flags & SHF_MERGE)) {
-    Alignment = std::max<uint64_t>(C->Alignment, C->Entsize);
-    Flags = C->Flags & (SHF_MERGE | SHF_STRINGS);
-  }
-
-  return SectionKey{OutsecName, Flags, Alignment};
+// If an input string is in the form of "foo.N" where N is a number,
+// return N. Otherwise, returns 65536, which is one greater than the
+// lowest priority.
+int elf::getPriority(StringRef S) {
+  size_t Pos = S.rfind('.');
+  if (Pos == StringRef::npos)
+    return 65536;
+  int V;
+  if (!to_integer(S.substr(Pos + 1), V, 10))
+    return 65536;
+  return V;
 }
 
-OutputSectionFactory::OutputSectionFactory(
-    std::vector<OutputSection *> &OutputSections)
-    : OutputSections(OutputSections) {}
-
-static uint64_t getIncompatibleFlags(uint64_t Flags) {
-  return Flags & (SHF_ALLOC | SHF_TLS);
+// Sorts input sections by section name suffixes, so that .foo.N comes
+// before .foo.M if N < M. Used to sort .{init,fini}_array.N sections.
+// We want to keep the original order if the priorities are the same
+// because the compiler keeps the original initialization order in a
+// translation unit and we need to respect that.
+// For more detail, read the section of the GCC's manual about init_priority.
+void OutputSection::sortInitFini() {
+  // Sort sections by priority.
+  sort([](InputSectionBase *S) { return getPriority(S->Name); });
 }
 
-// We allow sections of types listed below to merged into a
-// single progbits section. This is typically done by linker
-// scripts. Merging nobits and progbits will force disk space
-// to be allocated for nobits sections. Other ones don't require
-// any special treatment on top of progbits, so there doesn't
-// seem to be a harm in merging them.
-static bool canMergeToProgbits(unsigned Type) {
-  return Type == SHT_NOBITS || Type == SHT_PROGBITS || Type == SHT_INIT_ARRAY ||
-         Type == SHT_PREINIT_ARRAY || Type == SHT_FINI_ARRAY ||
-         Type == SHT_NOTE;
-}
-
-void elf::reportDiscarded(InputSectionBase *IS) {
-  if (!Config->PrintGcSections)
-    return;
-  message("removing unused section from '" + IS->Name + "' in file '" +
-          IS->File->getName() + "'");
-}
-
-void OutputSectionFactory::addInputSec(InputSectionBase *IS,
-                                       StringRef OutsecName) {
-  // Sections with the SHT_GROUP attribute reach here only when the - r option
-  // is given. Such sections define "section groups", and InputFiles.cpp has
-  // dedup'ed section groups by their signatures. For the -r, we want to pass
-  // through all SHT_GROUP sections without merging them because merging them
-  // creates broken section contents.
-  if (IS->Type == SHT_GROUP) {
-    OutputSection *Out = nullptr;
-    addInputSec(IS, OutsecName, Out);
-    return;
-  }
-
-  // Imagine .zed : { *(.foo) *(.bar) } script. Both foo and bar may have
-  // relocation sections .rela.foo and .rela.bar for example. Most tools do
-  // not allow multiple REL[A] sections for output section. Hence we
-  // should combine these relocation sections into single output.
-  // We skip synthetic sections because it can be .rela.dyn/.rela.plt or any
-  // other REL[A] sections created by linker itself.
-  if (!isa<SyntheticSection>(IS) &&
-      (IS->Type == SHT_REL || IS->Type == SHT_RELA)) {
-    auto *Sec = cast<InputSection>(IS);
-    OutputSection *Out = Sec->getRelocatedSection()->getOutputSection();
-    addInputSec(IS, OutsecName, Out->RelocationSection);
-    return;
-  }
-
-  SectionKey Key = createKey(IS, OutsecName);
-  OutputSection *&Sec = Map[Key];
-  addInputSec(IS, OutsecName, Sec);
-}
-
-void OutputSectionFactory::addInputSec(InputSectionBase *IS,
-                                       StringRef OutsecName,
-                                       OutputSection *&Sec) {
-  if (!IS->Live) {
-    reportDiscarded(IS);
-    return;
-  }
-
-  if (Sec) {
-    if (getIncompatibleFlags(Sec->Flags) != getIncompatibleFlags(IS->Flags))
-      error("incompatible section flags for " + Sec->Name +
-            "\n>>> " + toString(IS) + ": 0x" + utohexstr(IS->Flags) +
-            "\n>>> output section " + Sec->Name + ": 0x" +
-            utohexstr(Sec->Flags));
-    if (Sec->Type != IS->Type) {
-      if (canMergeToProgbits(Sec->Type) && canMergeToProgbits(IS->Type))
-        Sec->Type = SHT_PROGBITS;
-      else
-        error("section type mismatch for " + IS->Name +
-              "\n>>> " + toString(IS) + ": " +
-              getELFSectionTypeName(Config->EMachine, IS->Type) +
-              "\n>>> output section " + Sec->Name + ": " +
-              getELFSectionTypeName(Config->EMachine, Sec->Type));
-    }
-    Sec->Flags |= IS->Flags;
-  } else {
-    Sec = make<OutputSection>(OutsecName, IS->Type, IS->Flags);
-    OutputSections.push_back(Sec);
-  }
-
-  Sec->addSection(cast<InputSection>(IS));
-}
-
-OutputSectionFactory::~OutputSectionFactory() {}
-
-SectionKey DenseMapInfo<SectionKey>::getEmptyKey() {
-  return SectionKey{DenseMapInfo<StringRef>::getEmptyKey(), 0, 0};
-}
-
-SectionKey DenseMapInfo<SectionKey>::getTombstoneKey() {
-  return SectionKey{DenseMapInfo<StringRef>::getTombstoneKey(), 0, 0};
-}
-
-unsigned DenseMapInfo<SectionKey>::getHashValue(const SectionKey &Val) {
-  return hash_combine(Val.Name, Val.Flags, Val.Alignment);
-}
-
-bool DenseMapInfo<SectionKey>::isEqual(const SectionKey &LHS,
-                                       const SectionKey &RHS) {
-  return DenseMapInfo<StringRef>::isEqual(LHS.Name, RHS.Name) &&
-         LHS.Flags == RHS.Flags && LHS.Alignment == RHS.Alignment;
-}
-
-uint64_t elf::getHeaderSize() {
-  if (Config->OFormatBinary)
-    return 0;
-  return Out::ElfHeader->Size + Out::ProgramHeaders->Size;
+uint32_t OutputSection::getFiller() {
+  if (Filler)
+    return *Filler;
+  if (Flags & SHF_EXECINSTR)
+    return Target->TrapInstr;
+  return 0;
 }
 
 template void OutputSection::writeHeaderTo<ELF32LE>(ELF32LE::Shdr *Shdr);
 template void OutputSection::writeHeaderTo<ELF32BE>(ELF32BE::Shdr *Shdr);
 template void OutputSection::writeHeaderTo<ELF64LE>(ELF64LE::Shdr *Shdr);
 template void OutputSection::writeHeaderTo<ELF64BE>(ELF64BE::Shdr *Shdr);
+
+template void OutputSection::writeTo<ELF32LE>(uint8_t *Buf);
+template void OutputSection::writeTo<ELF32BE>(uint8_t *Buf);
+template void OutputSection::writeTo<ELF64LE>(uint8_t *Buf);
+template void OutputSection::writeTo<ELF64BE>(uint8_t *Buf);
+
+template void OutputSection::maybeCompress<ELF32LE>();
+template void OutputSection::maybeCompress<ELF32BE>();
+template void OutputSection::maybeCompress<ELF64LE>();
+template void OutputSection::maybeCompress<ELF64BE>();
+
+template void OutputSection::finalize<ELF32LE>();
+template void OutputSection::finalize<ELF32BE>();
+template void OutputSection::finalize<ELF64LE>();
+template void OutputSection::finalize<ELF64BE>();

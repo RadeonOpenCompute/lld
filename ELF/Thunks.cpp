@@ -72,9 +72,7 @@ public:
 
 class ThumbV7ABSLongThunk final : public Thunk {
 public:
-  ThumbV7ABSLongThunk(const SymbolBody &Dest) : Thunk(Dest) {
-    alignment = 2;
-  }
+  ThumbV7ABSLongThunk(const SymbolBody &Dest) : Thunk(Dest) { Alignment = 2; }
 
   uint32_t size() const override { return 10; }
   void writeTo(uint8_t *Buf, ThunkSection &IS) const override;
@@ -84,9 +82,7 @@ public:
 
 class ThumbV7PILongThunk final : public Thunk {
 public:
-  ThumbV7PILongThunk(const SymbolBody &Dest) : Thunk(Dest) {
-    alignment = 2;
-  }
+  ThumbV7PILongThunk(const SymbolBody &Dest) : Thunk(Dest) { Alignment = 2; }
 
   uint32_t size() const override { return 12; }
   void writeTo(uint8_t *Buf, ThunkSection &IS) const override;
@@ -164,16 +160,17 @@ bool ThumbV7ABSLongThunk::isCompatibleWith(uint32_t RelocType) const {
 
 void ARMV7PILongThunk::writeTo(uint8_t *Buf, ThunkSection &IS) const {
   const uint8_t Data[] = {
-      0xf0, 0xcf, 0x0f, 0xe3, // P:  movw ip,:lower16:S - (P + (L1-P) +8)
-      0x00, 0xc0, 0x40, 0xe3, //     movt ip,:upper16:S - (P + (L1-P+4) +8)
+      0xf0, 0xcf, 0x0f, 0xe3, // P:  movw ip,:lower16:S - (P + (L1-P) + 8)
+      0x00, 0xc0, 0x40, 0xe3, //     movt ip,:upper16:S - (P + (L1-P) + 8)
       0x0f, 0xc0, 0x8c, 0xe0, // L1: add ip, ip, pc
       0x1c, 0xff, 0x2f, 0xe1, //     bx r12
   };
   uint64_t S = getARMThunkDestVA(Destination);
   uint64_t P = ThunkSym->getVA();
+  uint64_t Offset = S - P - 16;
   memcpy(Buf, Data, sizeof(Data));
-  Target->relocateOne(Buf, R_ARM_MOVW_PREL_NC, S - P - 16);
-  Target->relocateOne(Buf + 4, R_ARM_MOVT_PREL, S - P - 12);
+  Target->relocateOne(Buf, R_ARM_MOVW_PREL_NC, Offset);
+  Target->relocateOne(Buf + 4, R_ARM_MOVT_PREL, Offset);
 }
 
 void ARMV7PILongThunk::addSymbols(ThunkSection &IS) {
@@ -191,15 +188,16 @@ bool ARMV7PILongThunk::isCompatibleWith(uint32_t RelocType) const {
 void ThumbV7PILongThunk::writeTo(uint8_t *Buf, ThunkSection &IS) const {
   const uint8_t Data[] = {
       0x4f, 0xf6, 0xf4, 0x7c, // P:  movw ip,:lower16:S - (P + (L1-P) + 4)
-      0xc0, 0xf2, 0x00, 0x0c, //     movt ip,:upper16:S - (P + (L1-P+4) + 4)
+      0xc0, 0xf2, 0x00, 0x0c, //     movt ip,:upper16:S - (P + (L1-P) + 4)
       0xfc, 0x44,             // L1: add  r12, pc
       0x60, 0x47,             //     bx   r12
   };
   uint64_t S = getARMThunkDestVA(Destination);
   uint64_t P = ThunkSym->getVA() & ~0x1;
+  uint64_t Offset = S - P - 12;
   memcpy(Buf, Data, sizeof(Data));
-  Target->relocateOne(Buf, R_ARM_THM_MOVW_PREL_NC, S - P - 12);
-  Target->relocateOne(Buf + 4, R_ARM_THM_MOVT_PREL, S - P - 8);
+  Target->relocateOne(Buf, R_ARM_THM_MOVW_PREL_NC, Offset);
+  Target->relocateOne(Buf + 4, R_ARM_THM_MOVT_PREL, Offset);
 }
 
 void ThumbV7PILongThunk::addSymbols(ThunkSection &IS) {
@@ -218,10 +216,10 @@ bool ThumbV7PILongThunk::isCompatibleWith(uint32_t RelocType) const {
 // Write MIPS LA25 thunk code to call PIC function from the non-PIC one.
 void MipsThunk::writeTo(uint8_t *Buf, ThunkSection &) const {
   uint64_t S = Destination.getVA();
-  write32(Buf, 0x3c190000, Config->Endianness);                // lui   $25, %hi(func)
+  write32(Buf, 0x3c190000, Config->Endianness); // lui   $25, %hi(func)
   write32(Buf + 4, 0x08000000 | (S >> 2), Config->Endianness); // j     func
-  write32(Buf + 8, 0x27390000, Config->Endianness);            // addiu $25, $25, %lo(func)
-  write32(Buf + 12, 0x00000000, Config->Endianness);           // nop
+  write32(Buf + 8, 0x27390000, Config->Endianness); // addiu $25, $25, %lo(func)
+  write32(Buf + 12, 0x00000000, Config->Endianness); // nop
   Target->relocateOne(Buf, R_MIPS_HI16, S);
   Target->relocateOne(Buf + 8, R_MIPS_LO16, S);
 }
@@ -262,9 +260,7 @@ static Thunk *addThunkArm(uint32_t Reloc, SymbolBody &S) {
   fatal("unrecognized relocation type");
 }
 
-static Thunk *addThunkMips(SymbolBody &S) {
-  return make<MipsThunk>(S);
-}
+static Thunk *addThunkMips(SymbolBody &S) { return make<MipsThunk>(S); }
 
 Thunk *addThunk(uint32_t RelocType, SymbolBody &S) {
   if (Config->EMachine == EM_ARM)

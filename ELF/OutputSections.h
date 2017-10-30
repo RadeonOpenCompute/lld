@@ -12,6 +12,7 @@
 
 #include "Config.h"
 #include "InputSection.h"
+#include "LinkerScript.h"
 #include "Relocations.h"
 
 #include "lld/Core/LLVM.h"
@@ -29,7 +30,7 @@ class InputSection;
 class InputSectionBase;
 class MergeInputSection;
 class OutputSection;
-template <class ELFT> class ObjectFile;
+template <class ELFT> class ObjFile;
 template <class ELFT> class SharedFile;
 class SharedSymbol;
 class DefinedRegular;
@@ -38,13 +39,14 @@ class DefinedRegular;
 // It is composed of multiple InputSections.
 // The writer creates multiple OutputSections and assign them unique,
 // non-overlapping file offsets and VAs.
-class OutputSection final : public SectionBase {
+class OutputSection final : public BaseCommand, public SectionBase {
 public:
   OutputSection(StringRef Name, uint32_t Type, uint64_t Flags);
 
   static bool classof(const SectionBase *S) {
     return S->kind() == SectionBase::Output;
   }
+  static bool classof(const BaseCommand *C);
 
   uint64_t getLMA() const { return Addr + LMAOffset; }
   template <typename ELFT> void writeHeaderTo(typename ELFT::Shdr *SHdr);
@@ -59,13 +61,14 @@ public:
       Alignment = Val;
   }
 
-  // Pointer to the first section in PT_LOAD segment, which this section
-  // also resides in. This field is used to correctly compute file offset
-  // of a section. When two sections share the same load segment, difference
-  // between their file offsets should be equal to difference between their
-  // virtual addresses. To compute some section offset we use the following
-  // formula: Off = Off_first + VA - VA_first.
-  OutputSection *FirstInPtLoad = nullptr;
+  // Pointer to the PT_LOAD segment, which this section resides in. This field
+  // is used to correctly compute file offset of a section. When two sections
+  // share the same load segment, difference between their file offsets should
+  // be equal to difference between their virtual addresses. To compute some
+  // section offset we use the following formula: Off = Off_first + VA -
+  // VA_first, where Off_first and VA_first is file offset and VA of first
+  // section in PT_LOAD.
+  PhdrEntry *PtLoad = nullptr;
 
   // Pointer to a relocation section for this section. Usually nullptr because
   // we consume relocations, but if --emit-relocs is specified (which is rare),
@@ -80,11 +83,6 @@ public:
   uint32_t ShName = 0;
 
   void addSection(InputSection *S);
-  void sort(std::function<int(InputSectionBase *S)> Order);
-  void sortInitFini();
-  void sortCtorsDtors();
-  void assignOffsets();
-  std::vector<InputSection *> Sections;
 
   // Used for implementation of --compress-debug-sections option.
   std::vector<uint8_t> ZDebugHeader;
@@ -92,7 +90,32 @@ public:
 
   // Location in the output buffer.
   uint8_t *Loc = nullptr;
+
+  // The following members are normally only used in linker scripts.
+  MemoryRegion *MemRegion = nullptr;
+  Expr AddrExpr;
+  Expr AlignExpr;
+  Expr LMAExpr;
+  Expr SubalignExpr;
+  std::vector<BaseCommand *> Commands;
+  std::vector<StringRef> Phdrs;
+  llvm::Optional<uint32_t> Filler;
+  ConstraintKind Constraint = ConstraintKind::NoConstraint;
+  std::string Location;
+  std::string MemoryRegionName;
+  bool Noload = false;
+
+  template <class ELFT> void finalize();
+  template <class ELFT> void writeTo(uint8_t *Buf);
+  template <class ELFT> void maybeCompress();
+  uint32_t getFiller();
+
+  void sort(std::function<int(InputSectionBase *S)> Order);
+  void sortInitFini();
+  void sortCtorsDtors();
 };
+
+int getPriority(StringRef S);
 
 // All output sections that are handled by the linker specially are
 // globally accessible. Writer initializes them, so don't use them
@@ -115,8 +138,8 @@ struct SectionKey {
   uint64_t Flags;
   uint32_t Alignment;
 };
-}
-}
+} // namespace elf
+} // namespace lld
 namespace llvm {
 template <> struct DenseMapInfo<lld::elf::SectionKey> {
   static lld::elf::SectionKey getEmptyKey();
@@ -125,7 +148,7 @@ template <> struct DenseMapInfo<lld::elf::SectionKey> {
   static bool isEqual(const lld::elf::SectionKey &LHS,
                       const lld::elf::SectionKey &RHS);
 };
-}
+} // namespace llvm
 namespace lld {
 namespace elf {
 
@@ -135,25 +158,23 @@ namespace elf {
 // linker scripts.
 class OutputSectionFactory {
 public:
-  OutputSectionFactory(std::vector<OutputSection *> &OutputSections);
+  OutputSectionFactory();
   ~OutputSectionFactory();
 
-  void addInputSec(InputSectionBase *IS, StringRef OutsecName);
   void addInputSec(InputSectionBase *IS, StringRef OutsecName,
-                   OutputSection *&Sec);
+                   OutputSection *OS = nullptr);
 
 private:
   llvm::SmallDenseMap<SectionKey, OutputSection *> Map;
-  std::vector<OutputSection *> &OutputSections;
 };
 
 uint64_t getHeaderSize();
 void reportDiscarded(InputSectionBase *IS);
+void sortByOrder(llvm::MutableArrayRef<InputSection *> In,
+                 std::function<int(InputSectionBase *S)> Order);
 
 extern std::vector<OutputSection *> OutputSections;
-extern std::vector<OutputSectionCommand *> OutputSectionCommands;
 } // namespace elf
 } // namespace lld
-
 
 #endif

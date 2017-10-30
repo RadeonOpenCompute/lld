@@ -12,6 +12,7 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Object/COFF.h"
+#include "llvm/Support/CachePruning.h"
 #include <cstdint>
 #include <map>
 #include <set>
@@ -82,6 +83,7 @@ struct Configuration {
   SymbolBody *Entry = nullptr;
   bool NoEntry = false;
   std::string OutputFile;
+  std::string ImportName;
   bool ColorDiagnostics;
   bool DoGC = true;
   bool DoICF = true;
@@ -92,6 +94,7 @@ struct Configuration {
   bool WriteSymtab = true;
   unsigned DebugTypes = static_cast<unsigned>(DebugType::None);
   llvm::SmallString<128> PDBPath;
+  std::vector<llvm::StringRef> Argv;
 
   // Symbols in this set are considered as live by the garbage collector.
   std::set<SymbolBody *> GCRoot;
@@ -121,6 +124,11 @@ struct Configuration {
   // Used for /opt:lldltopartitions=N
   unsigned LTOPartitions = 1;
 
+  // Used for /opt:lldltocache=path
+  StringRef LTOCache;
+  // Used for /opt:lldltocachepolicy=policy
+  llvm::CachePruningPolicy LTOCachePolicy;
+
   // Used for /merge:from=to (e.g. /merge:.rdata=.text)
   std::map<StringRef, StringRef> Merge;
 
@@ -128,7 +136,7 @@ struct Configuration {
   std::map<StringRef, uint32_t> Section;
 
   // Options for manifest files.
-  ManifestKind Manifest = SideBySide;
+  ManifestKind Manifest = No;
   int ManifestID = 1;
   StringRef ManifestDependency;
   bool ManifestUAC = true;
@@ -136,6 +144,9 @@ struct Configuration {
   StringRef ManifestLevel = "'asInvoker'";
   StringRef ManifestUIAccess = "'false'";
   StringRef ManifestFile;
+
+  // Used for /aligncomm.
+  std::map<std::string, int> AlignComm;
 
   // Used for /failifmismatch.
   std::map<StringRef, StringRef> MustMatch;
@@ -156,12 +167,14 @@ struct Configuration {
   uint32_t MajorOSVersion = 6;
   uint32_t MinorOSVersion = 0;
   bool DynamicBase = true;
+  bool AllowBind = true;
   bool NxCompat = true;
   bool AllowIsolation = true;
   bool TerminalServerAware = true;
   bool LargeAddressAware = false;
   bool HighEntropyVA = false;
   bool AppContainer = false;
+  bool MinGW = false;
 };
 
 extern Configuration *Config;

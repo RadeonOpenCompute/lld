@@ -4,6 +4,7 @@ config.llvm_src_root = "@LLVM_SOURCE_DIR@"
 config.llvm_obj_root = "@LLVM_BINARY_DIR@"
 config.llvm_tools_dir = "@LLVM_TOOLS_DIR@"
 config.llvm_libs_dir = "@LLVM_LIBS_DIR@"
+config.llvm_libxml2_enabled = "@LLVM_LIBXML2_ENABLED@"
 config.lit_tools_dir = "@LLVM_LIT_TOOLS_DIR@"
 config.lld_obj_root = "@LLD_BINARY_DIR@"
 config.lld_libs_dir = "@LLVM_LIBRARY_OUTPUT_INTDIR@"
@@ -21,5 +22,7 @@ except KeyError as e:
     key, = e.args
     lit_config.fatal("unable to find %r parameter, use '--param=%s=VALUE'" % (key,key))
 
+@LIT_SITE_CFG_IN_FOOTER@
+
 # Let the main config do the real work.
-lit_config.load_config(config, "@LLD_SOURCE_DIR@/test/lit.cfg")
+lit_config.load_config(config, "@LLD_SOURCE_DIR@/test/lit.cfg.py")
