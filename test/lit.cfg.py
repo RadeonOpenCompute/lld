@@ -10,7 +10,6 @@ import lit.formats
 import lit.util
 
 from lit.llvm import llvm_config
-from lit.llvm import ToolFilter
 
 # Configuration file for the 'lit' test runner.
 
@@ -36,30 +35,14 @@ config.test_source_root = os.path.dirname(__file__)
 
 config.test_exec_root = os.path.join(config.lld_obj_root, 'test')
 
-# Tweak the PATH to include the tools dir and the scripts dir.
-llvm_config.with_environment('PATH',
-                             [config.llvm_tools_dir, config.lld_tools_dir], append_path=True)
-
-llvm_config.with_environment('LD_LIBRARY_PATH',
-                             [config.lld_libs_dir, config.llvm_libs_dir], append_path=True)
-
-# For each occurrence of a clang tool name, replace it with the full path to
-# the build directory holding that tool.  We explicitly specify the directories
-# to search to ensure that we get the tools just built and not some random
-# tools that might happen to be in the user's PATH.
-tool_dirs = [config.lld_tools_dir, config.llvm_tools_dir]
-
-config.substitutions.append( (r"\bld.lld\b", 'ld.lld --full-shutdown') )
+llvm_config.use_default_substitutions()
+llvm_config.use_lld()
 
 tool_patterns = [
-    'FileCheck', 'not', 'ld.lld', 'lld-link', 'llvm-as', 'llvm-mc', 'llvm-nm',
-    'llvm-objdump', 'llvm-pdbutil', 'llvm-readobj', 'obj2yaml', 'yaml2obj',
-    ToolFilter('lld', pre='-./', post='-.')]
+    'llvm-as', 'llvm-mc', 'llvm-nm',
+    'llvm-objdump', 'llvm-pdbutil', 'llvm-readobj', 'obj2yaml', 'yaml2obj']
 
-llvm_config.add_tool_substitutions(tool_patterns, tool_dirs)
-
-# Add site-specific substitutions.
-config.substitutions.append( ('%python', config.python_executable) )
+llvm_config.add_tool_substitutions(tool_patterns)
 
 # When running under valgrind, we mangle '-vg' onto the end of the triple so we
 # can check it with XFAIL and XTARGET.
@@ -75,17 +58,17 @@ if platform.system() not in ['Windows']:
     config.available_features.add('demangler')
 
 llvm_config.feature_config(
-    [('--build-mode', {'DEBUG' : 'debug'}),
-     ('--assertion-mode', {'ON' : 'asserts'}),
-     ('--targets-built', {'AArch64' : 'aarch64',
-                          'AMDGPU' : 'amdgpu',
-                          'ARM' : 'arm',
-                          'AVR' : 'avr',
-                          'Mips' : 'mips',
-                          'PowerPC' : 'ppc',
-                          'Sparc' : 'sparc',
-                          'X86' : 'x86'})
-    ])
+    [('--build-mode', {'DEBUG': 'debug'}),
+     ('--assertion-mode', {'ON': 'asserts'}),
+     ('--targets-built', {'AArch64': 'aarch64',
+                          'AMDGPU': 'amdgpu',
+                          'ARM': 'arm',
+                          'AVR': 'avr',
+                          'Mips': 'mips',
+                          'PowerPC': 'ppc',
+                          'Sparc': 'sparc',
+                          'X86': 'x86'})
+     ])
 
 # Set a fake constant version so that we get consitent output.
 config.environment['LLD_VERSION'] = 'LLD 1.0'
@@ -94,8 +77,16 @@ config.environment['LLD_VERSION'] = 'LLD 1.0'
 # cvtres, which always accompanies it.  Alternatively, check if we can use
 # libxml2 to merge manifests.
 if (lit.util.which('cvtres', config.environment['PATH'])) or \
- (config.llvm_libxml2_enabled == "1"):
+        (config.llvm_libxml2_enabled == '1'):
     config.available_features.add('manifest_tool')
 
-if (config.llvm_libxml2_enabled == "1"):
+if (config.llvm_libxml2_enabled == '1'):
     config.available_features.add('libxml2')
+
+tar_executable = lit.util.which('tar', config.environment['PATH'])
+if tar_executable:
+    tar_version = subprocess.Popen(
+        [tar_executable, '--version'], stdout=subprocess.PIPE, env={'LANG': 'C'})
+    if 'GNU tar' in tar_version.stdout.read().decode():
+        config.available_features.add('gnutar')
+    tar_version.wait()

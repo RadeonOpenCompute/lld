@@ -23,13 +23,13 @@
 
 #include "Thunks.h"
 #include "Config.h"
-#include "Error.h"
 #include "InputSection.h"
 #include "Memory.h"
 #include "OutputSections.h"
 #include "Symbols.h"
 #include "SyntheticSections.h"
 #include "Target.h"
+#include "lld/Common/ErrorHandler.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Endian.h"
@@ -57,7 +57,7 @@ public:
   uint32_t size() const override { return 12; }
   void writeTo(uint8_t *Buf, ThunkSection &IS) const override;
   void addSymbols(ThunkSection &IS) override;
-  bool isCompatibleWith(uint32_t RelocType) const override;
+  bool isCompatibleWith(RelType Type) const override;
 };
 
 class ARMV7PILongThunk final : public Thunk {
@@ -67,7 +67,7 @@ public:
   uint32_t size() const override { return 16; }
   void writeTo(uint8_t *Buf, ThunkSection &IS) const override;
   void addSymbols(ThunkSection &IS) override;
-  bool isCompatibleWith(uint32_t RelocType) const override;
+  bool isCompatibleWith(RelType Type) const override;
 };
 
 class ThumbV7ABSLongThunk final : public Thunk {
@@ -77,7 +77,7 @@ public:
   uint32_t size() const override { return 10; }
   void writeTo(uint8_t *Buf, ThunkSection &IS) const override;
   void addSymbols(ThunkSection &IS) override;
-  bool isCompatibleWith(uint32_t RelocType) const override;
+  bool isCompatibleWith(RelType Type) const override;
 };
 
 class ThumbV7PILongThunk final : public Thunk {
@@ -87,7 +87,7 @@ public:
   uint32_t size() const override { return 12; }
   void writeTo(uint8_t *Buf, ThunkSection &IS) const override;
   void addSymbols(ThunkSection &IS) override;
-  bool isCompatibleWith(uint32_t RelocType) const override;
+  bool isCompatibleWith(RelType Type) const override;
 };
 
 // MIPS LA25 thunk
@@ -96,6 +96,28 @@ public:
   MipsThunk(const SymbolBody &Dest) : Thunk(Dest) {}
 
   uint32_t size() const override { return 16; }
+  void writeTo(uint8_t *Buf, ThunkSection &IS) const override;
+  void addSymbols(ThunkSection &IS) override;
+  InputSection *getTargetInputSection() const override;
+};
+
+// microMIPS R2-R5 LA25 thunk
+class MicroMipsThunk final : public Thunk {
+public:
+  MicroMipsThunk(const SymbolBody &Dest) : Thunk(Dest) {}
+
+  uint32_t size() const override { return 14; }
+  void writeTo(uint8_t *Buf, ThunkSection &IS) const override;
+  void addSymbols(ThunkSection &IS) override;
+  InputSection *getTargetInputSection() const override;
+};
+
+// microMIPS R6 LA25 thunk
+class MicroMipsR6Thunk final : public Thunk {
+public:
+  MicroMipsR6Thunk(const SymbolBody &Dest) : Thunk(Dest) {}
+
+  uint32_t size() const override { return 12; }
   void writeTo(uint8_t *Buf, ThunkSection &IS) const override;
   void addSymbols(ThunkSection &IS) override;
   InputSection *getTargetInputSection() const override;
@@ -128,9 +150,9 @@ void ARMV7ABSLongThunk::addSymbols(ThunkSection &IS) {
   addSyntheticLocal("$a", STT_NOTYPE, Offset, 0, &IS);
 }
 
-bool ARMV7ABSLongThunk::isCompatibleWith(uint32_t RelocType) const {
+bool ARMV7ABSLongThunk::isCompatibleWith(RelType Type) const {
   // Thumb branch relocations can't use BLX
-  return RelocType != R_ARM_THM_JUMP19 && RelocType != R_ARM_THM_JUMP24;
+  return Type != R_ARM_THM_JUMP19 && Type != R_ARM_THM_JUMP24;
 }
 
 void ThumbV7ABSLongThunk::writeTo(uint8_t *Buf, ThunkSection &IS) const {
@@ -152,10 +174,9 @@ void ThumbV7ABSLongThunk::addSymbols(ThunkSection &IS) {
   addSyntheticLocal("$t", STT_NOTYPE, Offset, 0, &IS);
 }
 
-bool ThumbV7ABSLongThunk::isCompatibleWith(uint32_t RelocType) const {
+bool ThumbV7ABSLongThunk::isCompatibleWith(RelType Type) const {
   // ARM branch relocations can't use BLX
-  return RelocType != R_ARM_JUMP24 && RelocType != R_ARM_PC24 &&
-         RelocType != R_ARM_PLT32;
+  return Type != R_ARM_JUMP24 && Type != R_ARM_PC24 && Type != R_ARM_PLT32;
 }
 
 void ARMV7PILongThunk::writeTo(uint8_t *Buf, ThunkSection &IS) const {
@@ -180,9 +201,9 @@ void ARMV7PILongThunk::addSymbols(ThunkSection &IS) {
   addSyntheticLocal("$a", STT_NOTYPE, Offset, 0, &IS);
 }
 
-bool ARMV7PILongThunk::isCompatibleWith(uint32_t RelocType) const {
+bool ARMV7PILongThunk::isCompatibleWith(RelType Type) const {
   // Thumb branch relocations can't use BLX
-  return RelocType != R_ARM_THM_JUMP19 && RelocType != R_ARM_THM_JUMP24;
+  return Type != R_ARM_THM_JUMP19 && Type != R_ARM_THM_JUMP24;
 }
 
 void ThumbV7PILongThunk::writeTo(uint8_t *Buf, ThunkSection &IS) const {
@@ -207,10 +228,9 @@ void ThumbV7PILongThunk::addSymbols(ThunkSection &IS) {
   addSyntheticLocal("$t", STT_NOTYPE, Offset, 0, &IS);
 }
 
-bool ThumbV7PILongThunk::isCompatibleWith(uint32_t RelocType) const {
+bool ThumbV7PILongThunk::isCompatibleWith(RelType Type) const {
   // ARM branch relocations can't use BLX
-  return RelocType != R_ARM_JUMP24 && RelocType != R_ARM_PC24 &&
-         RelocType != R_ARM_PLT32;
+  return Type != R_ARM_JUMP24 && Type != R_ARM_PC24 && Type != R_ARM_PLT32;
 }
 
 // Write MIPS LA25 thunk code to call PIC function from the non-PIC one.
@@ -235,12 +255,62 @@ InputSection *MipsThunk::getTargetInputSection() const {
   return dyn_cast<InputSection>(DR->Section);
 }
 
+// Write microMIPS R2-R5 LA25 thunk code
+// to call PIC function from the non-PIC one.
+void MicroMipsThunk::writeTo(uint8_t *Buf, ThunkSection &) const {
+  uint64_t S = Destination.getVA();
+  write16(Buf, 0x41b9, Config->Endianness);       // lui   $25, %hi(func)
+  write16(Buf + 4, 0xd400, Config->Endianness);   // j     func
+  write16(Buf + 8, 0x3339, Config->Endianness);   // addiu $25, $25, %lo(func)
+  write16(Buf + 12, 0x0c00, Config->Endianness);  // nop
+  Target->relocateOne(Buf, R_MICROMIPS_HI16, S);
+  Target->relocateOne(Buf + 4, R_MICROMIPS_26_S1, S);
+  Target->relocateOne(Buf + 8, R_MICROMIPS_LO16, S);
+}
+
+void MicroMipsThunk::addSymbols(ThunkSection &IS) {
+  ThunkSym =
+      addSyntheticLocal(Saver.save("__microLA25Thunk_" + Destination.getName()),
+                        STT_FUNC, Offset, size(), &IS);
+  ThunkSym->StOther |= STO_MIPS_MICROMIPS;
+}
+
+InputSection *MicroMipsThunk::getTargetInputSection() const {
+  auto *DR = dyn_cast<DefinedRegular>(&Destination);
+  return dyn_cast<InputSection>(DR->Section);
+}
+
+// Write microMIPS R6 LA25 thunk code
+// to call PIC function from the non-PIC one.
+void MicroMipsR6Thunk::writeTo(uint8_t *Buf, ThunkSection &) const {
+  uint64_t S = Destination.getVA();
+  uint64_t P = ThunkSym->getVA();
+  write16(Buf, 0x1320, Config->Endianness);       // lui   $25, %hi(func)
+  write16(Buf + 4, 0x3339, Config->Endianness);   // addiu $25, $25, %lo(func)
+  write16(Buf + 8, 0x9400, Config->Endianness);   // bc    func
+  Target->relocateOne(Buf, R_MICROMIPS_HI16, S);
+  Target->relocateOne(Buf + 4, R_MICROMIPS_LO16, S);
+  Target->relocateOne(Buf + 8, R_MICROMIPS_PC26_S1, S - P - 12);
+}
+
+void MicroMipsR6Thunk::addSymbols(ThunkSection &IS) {
+  ThunkSym =
+      addSyntheticLocal(Saver.save("__microLA25Thunk_" + Destination.getName()),
+                        STT_FUNC, Offset, size(), &IS);
+  ThunkSym->StOther |= STO_MIPS_MICROMIPS;
+}
+
+InputSection *MicroMipsR6Thunk::getTargetInputSection() const {
+  auto *DR = dyn_cast<DefinedRegular>(&Destination);
+  return dyn_cast<InputSection>(DR->Section);
+}
+
 Thunk::Thunk(const SymbolBody &D) : Destination(D), Offset(0) {}
 
 Thunk::~Thunk() = default;
 
 // Creates a thunk for Thumb-ARM interworking.
-static Thunk *addThunkArm(uint32_t Reloc, SymbolBody &S) {
+static Thunk *addThunkArm(RelType Reloc, SymbolBody &S) {
   // ARM relocations need ARM to Thumb interworking Thunks.
   // Thumb relocations need Thumb to ARM relocations.
   // Use position independent Thunks if we require position independent code.
@@ -260,13 +330,19 @@ static Thunk *addThunkArm(uint32_t Reloc, SymbolBody &S) {
   fatal("unrecognized relocation type");
 }
 
-static Thunk *addThunkMips(SymbolBody &S) { return make<MipsThunk>(S); }
+static Thunk *addThunkMips(RelType Type, SymbolBody &S) {
+  if ((S.StOther & STO_MIPS_MICROMIPS) && isMipsR6())
+    return make<MicroMipsR6Thunk>(S);
+  if (S.StOther & STO_MIPS_MICROMIPS)
+    return make<MicroMipsThunk>(S);
+  return make<MipsThunk>(S);
+}
 
-Thunk *addThunk(uint32_t RelocType, SymbolBody &S) {
+Thunk *addThunk(RelType Type, SymbolBody &S) {
   if (Config->EMachine == EM_ARM)
-    return addThunkArm(RelocType, S);
+    return addThunkArm(Type, S);
   else if (Config->EMachine == EM_MIPS)
-    return addThunkMips(S);
+    return addThunkMips(Type, S);
   llvm_unreachable("add Thunk only supported for ARM and Mips");
   return nullptr;
 }

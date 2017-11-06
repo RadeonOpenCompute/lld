@@ -8,7 +8,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "Symbols.h"
-#include "Error.h"
 #include "InputFiles.h"
 #include "InputSection.h"
 #include "OutputSections.h"
@@ -17,6 +16,7 @@
 #include "Target.h"
 #include "Writer.h"
 
+#include "lld/Common/ErrorHandler.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Path.h"
 #include <cstring>
@@ -99,14 +99,8 @@ static uint64_t getSymVA(const SymbolBody &Body, int64_t &Addend) {
     }
     return VA;
   }
-  case SymbolBody::DefinedCommonKind: {
-    if (!Config->DefineCommon)
-      return 0;
-    auto DC = cast<DefinedCommon>(Body);
-    if (!DC.Live)
-      return 0;
-    return DC.Section->getParent()->Addr + DC.Section->OutSecOff;
-  }
+  case SymbolBody::DefinedCommonKind:
+    llvm_unreachable("common are converted to bss");
   case SymbolBody::SharedKind: {
     auto &SS = cast<SharedSymbol>(Body);
     if (SS.CopyRelSec)
@@ -127,15 +121,15 @@ static uint64_t getSymVA(const SymbolBody &Body, int64_t &Addend) {
 
 SymbolBody::SymbolBody(Kind K, StringRefZ Name, bool IsLocal, uint8_t StOther,
                        uint8_t Type)
-    : SymbolKind(K), NeedsPltAddr(false), IsLocal(IsLocal),
+    : SymbolKind(K), IsLocal(IsLocal), NeedsPltAddr(false),
       IsInGlobalMipsGot(false), Is32BitMipsGot(false), IsInIplt(false),
       IsInIgot(false), IsPreemptible(false), Type(Type), StOther(StOther),
       Name(Name) {}
 
+// Returns true if this is a weak undefined symbol.
 bool SymbolBody::isUndefWeak() const {
-  if (isLocal())
-    return false;
-  return symbol()->isWeak() && (isUndefined() || isLazy());
+  // See comment on Lazy in Symbols.h for the details.
+  return !isLocal() && symbol()->isWeak() && (isUndefined() || isLazy());
 }
 
 InputFile *SymbolBody::getFile() const {
@@ -286,7 +280,7 @@ DefinedCommon::DefinedCommon(StringRef Name, uint64_t Size, uint32_t Alignment,
                              uint8_t StOther, uint8_t Type)
     : Defined(SymbolBody::DefinedCommonKind, Name, /*IsLocal=*/false, StOther,
               Type),
-      Live(!Config->GcSections), Alignment(Alignment), Size(Size) {}
+      Alignment(Alignment), Size(Size) {}
 
 // If a shared symbol is referred via a copy relocation, its alignment
 // becomes part of the ABI. This function returns a symbol alignment.
