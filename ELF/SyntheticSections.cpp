@@ -16,7 +16,6 @@
 
 #include "SyntheticSections.h"
 #include "Config.h"
-#include "Error.h"
 #include "InputFiles.h"
 #include "LinkerScript.h"
 #include "Memory.h"
@@ -24,9 +23,10 @@
 #include "Strings.h"
 #include "SymbolTable.h"
 #include "Target.h"
-#include "Threads.h"
 #include "Writer.h"
-#include "lld/Config/Version.h"
+#include "lld/Common/ErrorHandler.h"
+#include "lld/Common/Threads.h"
+#include "lld/Common/Version.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/DebugInfo/DWARF/DWARFDebugPubTable.h"
 #include "llvm/Object/Decompressor.h"
@@ -37,6 +37,7 @@
 #include "llvm/Support/SHA1.h"
 #include "llvm/Support/xxhash.h"
 #include <cstdlib>
+#include <thread>
 
 using namespace llvm;
 using namespace llvm::dwarf;
@@ -48,30 +49,35 @@ using namespace llvm::support::endian;
 using namespace lld;
 using namespace lld::elf;
 
+constexpr size_t MergeNoTailSection::NumShards;
+
 uint64_t SyntheticSection::getVA() const {
   if (OutputSection *Sec = getParent())
     return Sec->Addr + OutSecOff;
   return 0;
 }
 
-std::vector<InputSection *> elf::createCommonSections() {
-  if (!Config->DefineCommon)
-    return {};
-
-  std::vector<InputSection *> Ret;
+// Create a .bss section for each common symbol and replace the common symbol
+// with a DefinedRegular symbol.
+template <class ELFT> void elf::createCommonSections() {
   for (Symbol *S : Symtab->getSymbols()) {
     auto *Sym = dyn_cast<DefinedCommon>(S->body());
-    if (!Sym || !Sym->Live)
+
+    if (!Sym)
       continue;
 
-    Sym->Section = make<BssSection>("COMMON");
-    size_t Pos = Sym->Section->reserveSpace(Sym->Size, Sym->Alignment);
-    assert(Pos == 0);
-    (void)Pos;
-    Sym->Section->File = Sym->getFile();
-    Ret.push_back(Sym->Section);
+    // Create a synthetic section for the common data.
+    auto *Section = make<BssSection>("COMMON", Sym->Size, Sym->Alignment);
+    Section->File = Sym->getFile();
+    Section->Live = !Config->GcSections;
+    InputSections.push_back(Section);
+
+    // Replace all DefinedCommon symbols with DefinedRegular symbols so that we
+    // don't have to care about DefinedCommon symbols beyond this point.
+    replaceBody<DefinedRegular>(S, Sym->getFile(), Sym->getName(),
+                                static_cast<bool>(Sym->isLocal()), Sym->StOther,
+                                Sym->Type, 0, Sym->getSize<ELFT>(), Section);
   }
-  return Ret;
 }
 
 // Returns an LLD version string.
@@ -144,7 +150,7 @@ MipsAbiFlagsSection<ELFT> *MipsAbiFlagsSection<ELFT>::create() {
       return nullptr;
     }
 
-    // LLD checks ISA compatibility in getMipsEFlags(). Here we just
+    // LLD checks ISA compatibility in calcMipsEFlags(). Here we just
     // select the highest number of ISA/Rev/Ext.
     Flags.isa_level = std::max(Flags.isa_level, S->isa_level);
     Flags.isa_rev = std::max(Flags.isa_rev, S->isa_rev);
@@ -354,15 +360,11 @@ void BuildIdSection::computeHash(
   HashFn(HashBuf, Hashes);
 }
 
-BssSection::BssSection(StringRef Name)
-    : SyntheticSection(SHF_ALLOC | SHF_WRITE, SHT_NOBITS, 0, Name) {}
-
-size_t BssSection::reserveSpace(uint64_t Size, uint32_t Alignment) {
+BssSection::BssSection(StringRef Name, uint64_t Size, uint32_t Alignment)
+    : SyntheticSection(SHF_ALLOC | SHF_WRITE, SHT_NOBITS, Alignment, Name) {
   if (OutputSection *Sec = getParent())
-    Sec->updateAlignment(Alignment);
-  this->Size = alignTo(this->Size, Alignment) + Size;
-  this->Alignment = std::max(this->Alignment, Alignment);
-  return this->Size - Size;
+    Sec->Alignment = std::max(Sec->Alignment, Alignment);
+  this->Size = Size;
 }
 
 void BuildIdSection::writeBuildId(ArrayRef<uint8_t> Buf) {
@@ -447,9 +449,11 @@ bool EhFrameSection<ELFT>::isFdeLive(EhSectionPiece &Fde,
 
   const RelTy &Rel = Rels[FirstRelI];
   SymbolBody &B = Sec->template getFile<ELFT>()->getRelocTargetSym(Rel);
+
+  // FDEs for garbage-collected or merged-by-ICF sections are dead.
   if (auto *D = dyn_cast<DefinedRegular>(&B))
-    if (D->Section)
-      return cast<InputSectionBase>(D->Section)->Repl->Live;
+    if (auto *Sec = cast_or_null<InputSectionBase>(D->Section))
+      return Sec->Live && (Sec == Sec->Repl);
   return false;
 }
 
@@ -492,8 +496,10 @@ template <class ELFT>
 void EhFrameSection<ELFT>::addSection(InputSectionBase *C) {
   auto *Sec = cast<EhInputSection>(C);
   Sec->Parent = this;
-  updateAlignment(Sec->Alignment);
+
+  Alignment = std::max(Alignment, Sec->Alignment);
   Sections.push_back(Sec);
+
   for (auto *DS : Sec->DependentSections)
     DependentSections.push_back(DS);
 
@@ -585,6 +591,8 @@ uint64_t EhFrameSection<ELFT>::getFdePc(uint8_t *Buf, size_t FdeOff,
 
 template <class ELFT> void EhFrameSection<ELFT>::writeTo(uint8_t *Buf) {
   const endianness E = ELFT::TargetEndianness;
+
+  // Write CIE and FDE records.
   for (CieRecord *Rec : CieRecords) {
     size_t CieOffset = Rec->Cie->OutputOff;
     writeCieFde<ELFT>(Buf + CieOffset, Rec->Cie->data());
@@ -599,6 +607,9 @@ template <class ELFT> void EhFrameSection<ELFT>::writeTo(uint8_t *Buf) {
     }
   }
 
+  // Apply relocations. .eh_frame section contents are not contiguous
+  // in the output buffer, but relocateAlloc() still works because
+  // getOffset() takes care of discontiguous section pieces.
   for (EhInputSection *S : Sections)
     S->relocateAlloc(Buf, nullptr);
 
@@ -725,7 +736,7 @@ void MipsGotSection::addEntry(SymbolBody &Sym, int64_t Addend, RelExpr Expr) {
     if (!A)
       S.GotIndex = NewIndex;
   };
-  if (Sym.isPreemptible()) {
+  if (Sym.IsPreemptible) {
     // Ignore addends for preemptible symbols. They got single GOT entry anyway.
     AddEntry(Sym, 0, GlobalEntries);
     Sym.IsInGlobalMipsGot = true;
@@ -901,7 +912,7 @@ void MipsGotSection::writeTo(uint8_t *Buf) {
   if (TlsIndexOff != -1U && !Config->Pic)
     writeUint(Buf + TlsIndexOff, 1);
   for (const SymbolBody *B : TlsEntries) {
-    if (!B || B->isPreemptible())
+    if (!B || B->IsPreemptible)
       continue;
     uint64_t VA = B->getVA();
     if (B->GotIndex != -1U) {
@@ -1157,7 +1168,7 @@ template <class ELFT> void DynamicSection<ELFT>::finalizeContents() {
   if (Config->EMachine == EM_MIPS) {
     add({DT_MIPS_RLD_VERSION, 1});
     add({DT_MIPS_FLAGS, RHF_NOTPOT});
-    add({DT_MIPS_BASE_ADDRESS, Config->ImageBase});
+    add({DT_MIPS_BASE_ADDRESS, Target->getImageBase()});
     add({DT_MIPS_SYMTABNO, InX::DynSymTab->getNumSymbols()});
     add({DT_MIPS_LOCAL_GOTNO, InX::MipsGot->getLocalEntriesNum()});
     if (const SymbolBody *B = InX::MipsGot->getFirstGlobalEntry())
@@ -1169,10 +1180,10 @@ template <class ELFT> void DynamicSection<ELFT>::finalizeContents() {
       add({DT_MIPS_RLD_MAP, InX::MipsRldMap});
   }
 
-  getParent()->Link = this->Link;
+  add({DT_NULL, (uint64_t)0});
 
-  // +1 for DT_NULL
-  this->Size = (Entries.size() + 1) * this->Entsize;
+  getParent()->Link = this->Link;
+  this->Size = Entries.size() * this->Entsize;
 }
 
 template <class ELFT> void DynamicSection<ELFT>::writeTo(uint8_t *Buf) {
@@ -1275,8 +1286,10 @@ template <class ELFT> unsigned RelocationSection<ELFT>::getRelocOffset() {
 }
 
 template <class ELFT> void RelocationSection<ELFT>::finalizeContents() {
-  this->Link = InX::DynSymTab ? InX::DynSymTab->getParent()->SectionIndex
-                              : InX::SymTab->getParent()->SectionIndex;
+  // If all relocations are *RELATIVE they don't refer to any
+  // dynamic symbol and we don't need a dynamic symbol table. If that
+  // is the case, just use 0 as the link.
+  this->Link = InX::DynSymTab ? InX::DynSymTab->getParent()->SectionIndex : 0;
 
   // Set required output section properties.
   getParent()->Link = this->Link;
@@ -1305,10 +1318,6 @@ static bool sortMipsSymbols(const SymbolTableEntry &L,
   return L.Symbol->GotIndex < R.Symbol->GotIndex;
 }
 
-// Finalize a symbol table. The ELF spec requires that all local
-// symbols precede global symbols, so we sort symbol entries in this
-// function. (For .dynsym, we don't do that because symbols for
-// dynamic linking are inherently all globals.)
 void SymbolTableBaseSection::finalizeContents() {
   getParent()->Link = StrTabSec.getParent()->SectionIndex;
 
@@ -1333,6 +1342,9 @@ void SymbolTableBaseSection::finalizeContents() {
   }
 }
 
+// The ELF spec requires that all local symbols precede global symbols, so we
+// sort symbol entries in this function. (For .dynsym, we don't do that because
+// symbols for dynamic linking are inherently all globals.)
 void SymbolTableBaseSection::postThunkContents() {
   if (this->Type == SHT_DYNSYM)
     return;
@@ -1384,6 +1396,7 @@ SymbolTableSection<ELFT>::SymbolTableSection(StringTableSection &StrTabSec)
 // Write the internal symbol table contents to the output symbol table.
 template <class ELFT> void SymbolTableSection<ELFT>::writeTo(uint8_t *Buf) {
   // The first entry is a null entry as per the ELF spec.
+  memset(Buf, 0, sizeof(Elf_Sym));
   Buf += sizeof(Elf_Sym);
 
   auto *ESym = reinterpret_cast<Elf_Sym *>(Buf);
@@ -1392,6 +1405,7 @@ template <class ELFT> void SymbolTableSection<ELFT>::writeTo(uint8_t *Buf) {
     SymbolBody *Body = Ent.Symbol;
 
     // Set st_info and st_other.
+    ESym->st_other = 0;
     if (Body->isLocal()) {
       ESym->setBindingAndType(STB_LOCAL, Body->Type);
     } else {
@@ -1408,13 +1422,17 @@ template <class ELFT> void SymbolTableSection<ELFT>::writeTo(uint8_t *Buf) {
       ESym->st_shndx = SHN_ABS;
     else if (isa<DefinedCommon>(Body))
       ESym->st_shndx = SHN_COMMON;
+    else
+      ESym->st_shndx = SHN_UNDEF;
 
     // Copy symbol size if it is a defined symbol. st_size is not significant
     // for undefined symbols, so whether copying it or not is up to us if that's
     // the case. We'll leave it as zero because by not setting a value, we can
     // get the exact same outputs for two sets of input files that differ only
     // in undefined symbol size in DSOs.
-    if (ESym->st_shndx != SHN_UNDEF)
+    if (ESym->st_shndx == SHN_UNDEF)
+      ESym->st_size = 0;
+    else
       ESym->st_size = Body->getSize<ELFT>();
 
     // st_value is usually an address of a symbol, but that has a
@@ -1591,7 +1609,11 @@ void GnuHashTableSection::addSymbols(std::vector<SymbolTableEntry> &V) {
   // its type correctly.
   std::vector<SymbolTableEntry>::iterator Mid =
       std::stable_partition(V.begin(), V.end(), [](const SymbolTableEntry &S) {
-        return S.Symbol->isUndefined();
+        // Shared symbols that this executable preempts are special. The dynamic
+        // linker has to look them up, so they have to be in the hash table.
+        if (auto *SS = dyn_cast<SharedSymbol>(S.Symbol))
+          return SS->CopyRelSec == nullptr && !SS->NeedsPltAddr;
+        return !S.Symbol->isInCurrentDSO();
       });
   if (Mid == V.end())
     return;
@@ -1624,8 +1646,6 @@ void HashTableSection::finalizeContents() {
   NumEntries += InX::DynSymTab->getNumSymbols(); // The chain entries.
 
   // Create as many buckets as there are symbols.
-  // FIXME: This is simplistic. We can try to optimize it, but implementing
-  // support for SHT_GNU_HASH is probably even more profitable.
   NumEntries += InX::DynSymTab->getNumSymbols();
   this->Size = NumEntries * 4;
 }
@@ -1816,6 +1836,7 @@ std::vector<std::vector<uint32_t>> GdbIndexSection::createCuVectors() {
 }
 
 template <class ELFT> GdbIndexSection *elf::createGdbIndex() {
+  // Gather debug info to create a .gdb_index section.
   std::vector<InputSection *> Sections = getDebugInfoSections();
   std::vector<GdbIndexChunk> Chunks(Sections.size());
 
@@ -1829,6 +1850,14 @@ template <class ELFT> GdbIndexSection *elf::createGdbIndex() {
     Chunks[I].NamesAndTypes = readPubNamesAndTypes(Dwarf);
   });
 
+  // .debug_gnu_pub{names,types} are useless in executables.
+  // They are present in input object files solely for creating
+  // a .gdb_index. So we can remove it from the output.
+  for (InputSectionBase *S : InputSections)
+    if (S->Name == ".debug_gnu_pubnames" || S->Name == ".debug_gnu_pubtypes")
+      S->Live = false;
+
+  // Create a .gdb_index and returns it.
   return make<GdbIndexSection>(std::move(Chunks));
 }
 
@@ -2177,19 +2206,19 @@ template <class ELFT> bool VersionNeedSection<ELFT>::empty() const {
   return getNeedNum() == 0;
 }
 
-MergeSyntheticSection::MergeSyntheticSection(StringRef Name, uint32_t Type,
-                                             uint64_t Flags, uint32_t Alignment)
-    : SyntheticSection(Flags, Type, Alignment, Name),
-      Builder(StringTableBuilder::RAW, Alignment) {}
-
 void MergeSyntheticSection::addSection(MergeInputSection *MS) {
   MS->Parent = this;
   Sections.push_back(MS);
 }
 
-size_t MergeSyntheticSection::getSize() const { return Builder.getSize(); }
+MergeTailSection::MergeTailSection(StringRef Name, uint32_t Type,
+                                   uint64_t Flags, uint32_t Alignment)
+    : MergeSyntheticSection(Name, Type, Flags, Alignment),
+      Builder(StringTableBuilder::RAW, Alignment) {}
 
-void MergeSyntheticSection::writeTo(uint8_t *Buf) { Builder.write(Buf); }
+size_t MergeTailSection::getSize() const { return Builder.getSize(); }
+
+void MergeTailSection::writeTo(uint8_t *Buf) { Builder.write(Buf); }
 
 void MergeTailSection::finalizeContents() {
   // Add all string pieces to the string table builder to create section
@@ -2211,17 +2240,63 @@ void MergeTailSection::finalizeContents() {
         Sec->Pieces[I].OutputOff = Builder.getOffset(Sec->getData(I));
 }
 
+void MergeNoTailSection::writeTo(uint8_t *Buf) {
+  for (size_t I = 0; I < NumShards; ++I)
+    Shards[I].write(Buf + ShardOffsets[I]);
+}
+
+// This function is very hot (i.e. it can take several seconds to finish)
+// because sometimes the number of inputs is in an order of magnitude of
+// millions. So, we use multi-threading.
+//
+// For any strings S and T, we know S is not mergeable with T if S's hash
+// value is different from T's. If that's the case, we can safely put S and
+// T into different string builders without worrying about merge misses.
+// We do it in parallel.
 void MergeNoTailSection::finalizeContents() {
-  // Add all string pieces to the string table builder to create section
-  // contents. Because we are not tail-optimizing, offsets of strings are
-  // fixed when they are added to the builder (string table builder contains
-  // a hash table from strings to offsets).
-  for (MergeInputSection *Sec : Sections)
+  // Initializes string table builders.
+  for (size_t I = 0; I < NumShards; ++I)
+    Shards.emplace_back(StringTableBuilder::RAW, Alignment);
+
+  // Concurrency level. Must be a power of 2 to avoid expensive modulo
+  // operations in the following tight loop.
+  size_t Concurrency = 1;
+  if (ThreadsEnabled)
+    Concurrency =
+        std::min<size_t>(PowerOf2Floor(hardware_concurrency()), NumShards);
+
+  // Add section pieces to the builders.
+  parallelForEachN(0, Concurrency, [&](size_t ThreadId) {
+    for (MergeInputSection *Sec : Sections) {
+      for (size_t I = 0, E = Sec->Pieces.size(); I != E; ++I) {
+        if (!Sec->Pieces[I].Live)
+          continue;
+        size_t ShardId = getShardId(Sec->Pieces[I].Hash);
+        if ((ShardId & (Concurrency - 1)) == ThreadId)
+          Sec->Pieces[I].OutputOff = Shards[ShardId].add(Sec->getData(I));
+      }
+    }
+  });
+
+  // Compute an in-section offset for each shard.
+  size_t Off = 0;
+  for (size_t I = 0; I < NumShards; ++I) {
+    Shards[I].finalizeInOrder();
+    if (Shards[I].getSize() > 0)
+      Off = alignTo(Off, Alignment);
+    ShardOffsets[I] = Off;
+    Off += Shards[I].getSize();
+  }
+  Size = Off;
+
+  // So far, section pieces have offsets from beginning of shards, but
+  // we want offsets from beginning of the whole section. Fix them.
+  parallelForEach(Sections, [&](MergeInputSection *Sec) {
     for (size_t I = 0, E = Sec->Pieces.size(); I != E; ++I)
       if (Sec->Pieces[I].Live)
-        Sec->Pieces[I].OutputOff = Builder.add(Sec->getData(I));
-
-  Builder.finalizeInOrder();
+        Sec->Pieces[I].OutputOff +=
+            ShardOffsets[getShardId(Sec->Pieces[I].Hash)];
+  });
 }
 
 static MergeSyntheticSection *createMergeSynthetic(StringRef Name,
@@ -2234,22 +2309,28 @@ static MergeSyntheticSection *createMergeSynthetic(StringRef Name,
   return make<MergeNoTailSection>(Name, Type, Flags, Alignment);
 }
 
-// This function decompresses compressed sections and scans over the input
-// sections to create mergeable synthetic sections. It removes
-// MergeInputSections from the input section array and adds new synthetic
-// sections at the location of the first input section that it replaces. It then
-// finalizes each synthetic section in order to compute an output offset for
-// each piece of each input section.
-void elf::decompressAndMergeSections() {
-  // splitIntoPieces needs to be called on each MergeInputSection before calling
-  // finalizeContents(). Do that first.
-  parallelForEach(InputSections, [](InputSectionBase *S) {
-    if (!S->Live)
-      return;
-    if (Decompressor::isCompressedELFSection(S->Flags, S->Name))
-      S->uncompress();
-    if (auto *MS = dyn_cast<MergeInputSection>(S))
-      MS->splitIntoPieces();
+// Debug sections may be compressed by zlib. Uncompress if exists.
+void elf::decompressSections() {
+  parallelForEach(InputSections, [](InputSectionBase *Sec) {
+    if (Sec->Live)
+      Sec->maybeUncompress();
+  });
+}
+
+// This function scans over the inputsections to create mergeable
+// synthetic sections.
+//
+// It removes MergeInputSections from the input section array and adds
+// new synthetic sections at the location of the first input section
+// that it replaces. It then finalizes each synthetic section in order
+// to compute an output offset for each piece of each input section.
+void elf::mergeSections() {
+  // splitIntoPieces needs to be called on each MergeInputSection
+  // before calling finalizeContents(). Do that first.
+  parallelForEach(InputSections, [](InputSectionBase *Sec) {
+    if (Sec->Live)
+      if (auto *S = dyn_cast<MergeInputSection>(Sec))
+        S->splitIntoPieces();
   });
 
   std::vector<MergeSyntheticSection *> MergeSections;
@@ -2308,10 +2389,11 @@ void ARMExidxSentinelSection::writeTo(uint8_t *Buf) {
   // sentinel. By construction the Sentinel is in the last
   // InputSectionDescription as the InputSection that precedes it.
   OutputSection *C = getParent();
-  auto ISD = std::find_if(C->Commands.rbegin(), C->Commands.rend(),
-                          [](const BaseCommand *Base) {
-                            return isa<InputSectionDescription>(Base);
-                          });
+  auto ISD =
+      std::find_if(C->SectionCommands.rbegin(), C->SectionCommands.rend(),
+                   [](const BaseCommand *Base) {
+                     return isa<InputSectionDescription>(Base);
+                   });
   auto L = cast<InputSectionDescription>(*ISD);
   InputSection *Highest = L->Sections[L->Sections.size() - 2];
   InputSection *LS = Highest->getLinkOrderDep();
@@ -2377,6 +2459,11 @@ template void PltSection::addEntry<ELF32LE>(SymbolBody &Sym);
 template void PltSection::addEntry<ELF32BE>(SymbolBody &Sym);
 template void PltSection::addEntry<ELF64LE>(SymbolBody &Sym);
 template void PltSection::addEntry<ELF64BE>(SymbolBody &Sym);
+
+template void elf::createCommonSections<ELF32LE>();
+template void elf::createCommonSections<ELF32BE>();
+template void elf::createCommonSections<ELF64LE>();
+template void elf::createCommonSections<ELF64BE>();
 
 template MergeInputSection *elf::createCommentSection<ELF32LE>();
 template MergeInputSection *elf::createCommentSection<ELF32BE>();

@@ -11,10 +11,10 @@
 #include "Chunks.h"
 #include "Config.h"
 #include "Driver.h"
-#include "Error.h"
 #include "Memory.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
+#include "lld/Common/ErrorHandler.h"
 #include "llvm-c/lto.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Triple.h"
@@ -127,9 +127,9 @@ void ObjFile::initializeChunks() {
     const coff_section *Sec;
     StringRef Name;
     if (auto EC = COFFObj->getSection(I, Sec))
-      fatal(EC, "getSection failed: #" + Twine(I));
+      fatal("getSection failed: #" + Twine(I) + ": " + EC.message());
     if (auto EC = COFFObj->getSectionName(Sec, Name))
-      fatal(EC, "getSectionName failed: #" + Twine(I));
+      fatal("getSectionName failed: #" + Twine(I) + ": " + EC.message());
     if (Name == ".sxdata") {
       SXData = Sec;
       continue;
@@ -179,15 +179,11 @@ void ObjFile::initializeSymbols() {
   int32_t LastSectionNumber = 0;
 
   for (uint32_t I = 0; I < NumSymbols; ++I) {
-    // Get a COFFSymbolRef object.
-    ErrorOr<COFFSymbolRef> SymOrErr = COFFObj->getSymbol(I);
-    if (!SymOrErr)
-      fatal(SymOrErr.getError(), "broken object file: " + toString(this));
-    COFFSymbolRef Sym = *SymOrErr;
+    COFFSymbolRef Sym = check(COFFObj->getSymbol(I));
 
     const void *AuxP = nullptr;
     if (Sym.getNumberOfAuxSymbols())
-      AuxP = COFFObj->getSymbol(I + 1)->getRawPtr();
+      AuxP = check(COFFObj->getSymbol(I + 1)).getRawPtr();
     bool IsFirst = (LastSectionNumber != Sym.getSectionNumber());
 
     SymbolBody *Body = nullptr;

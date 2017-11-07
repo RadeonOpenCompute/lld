@@ -9,10 +9,10 @@
 
 #include "LTO.h"
 #include "Config.h"
-#include "Error.h"
 #include "InputFiles.h"
 #include "Symbols.h"
-#include "lld/Core/TargetOptionsCommandFlags.h"
+#include "lld/Common/ErrorHandler.h"
+#include "lld/Common/TargetOptionsCommandFlags.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
@@ -64,7 +64,13 @@ static void saveBuffer(StringRef Buffer, const Twine &Path) {
 static std::unique_ptr<lto::LTO> createLTO() {
   lto::Config Conf;
   Conf.Options = InitTargetOptionsFromCodeGenFlags();
-  Conf.RelocModel = Reloc::PIC_;
+  // Use static reloc model on 32-bit x86 because it usually results in more
+  // compact code, and because there are also known code generation bugs when
+  // using the PIC model (see PR34306).
+  if (Config->Machine == COFF::IMAGE_FILE_MACHINE_I386)
+    Conf.RelocModel = Reloc::Static;
+  else
+    Conf.RelocModel = Reloc::PIC_;
   Conf.DisableVerify = true;
   Conf.DiagHandler = diagnosticHandler;
   Conf.OptLevel = Config->LTOOptLevel;

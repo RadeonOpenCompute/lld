@@ -9,12 +9,12 @@
 
 #include "LTO.h"
 #include "Config.h"
-#include "Error.h"
-#include "LinkerScript.h"
 #include "InputFiles.h"
+#include "LinkerScript.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
-#include "lld/Core/TargetOptionsCommandFlags.h"
+#include "lld/Common/ErrorHandler.h"
+#include "lld/Common/TargetOptionsCommandFlags.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
@@ -130,7 +130,7 @@ void BitcodeCompiler::add(BitcodeFile &F) {
   std::vector<lto::SymbolResolution> Resols(Syms.size());
 
   DenseSet<StringRef> ScriptSymbols;
-  for (BaseCommand *Base : Script->Opt.Commands)
+  for (BaseCommand *Base : Script->SectionCommands)
     if (auto *Cmd = dyn_cast<SymbolAssignment>(Base))
       ScriptSymbols.insert(Cmd->Name);
 
