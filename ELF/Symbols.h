@@ -185,9 +185,7 @@ public:
   Defined(StringRefZ Name, uint8_t Binding, uint8_t StOther, uint8_t Type,
           uint64_t Value, uint64_t Size, SectionBase *Section)
       : Symbol(DefinedKind, Name, Binding, StOther, Type), Value(Value),
-        Size(Size), Section(Section) {
-    this->Binding = Binding;
-  }
+        Size(Size), Section(Section) {}
 
   static bool classof(const Symbol *S) { return S->isDefined(); }
 
@@ -199,9 +197,7 @@ public:
 class Undefined : public Symbol {
 public:
   Undefined(StringRefZ Name, uint8_t Binding, uint8_t StOther, uint8_t Type)
-      : Symbol(UndefinedKind, Name, Binding, StOther, Type) {
-    this->Binding = Binding;
-  }
+      : Symbol(UndefinedKind, Name, Binding, StOther, Type) {}
 
   static bool classof(const Symbol *S) { return S->kind() == UndefinedKind; }
 };
@@ -210,10 +206,11 @@ class SharedSymbol : public Symbol {
 public:
   static bool classof(const Symbol *S) { return S->kind() == SharedKind; }
 
-  SharedSymbol(StringRef Name, uint8_t StOther, uint8_t Type, uint64_t Value,
-               uint64_t Size, uint32_t Alignment, const void *Verdef)
-      : Symbol(SharedKind, Name, llvm::ELF::STB_WEAK, StOther, Type),
-        Verdef(Verdef), Value(Value), Size(Size), Alignment(Alignment) {
+  SharedSymbol(StringRef Name, uint8_t Binding, uint8_t StOther, uint8_t Type,
+               uint64_t Value, uint64_t Size, uint32_t Alignment,
+               const void *Verdef)
+      : Symbol(SharedKind, Name, Binding, StOther, Type), Verdef(Verdef),
+        Value(Value), Size(Size), Alignment(Alignment) {
     // GNU ifunc is a mechanism to allow user-supplied functions to
     // resolve PLT slot values at load-time. This is contrary to the
     // regualr symbol resolution scheme in which symbols are resolved just
