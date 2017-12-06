@@ -37,7 +37,7 @@ void markLive(const std::vector<Chunk *> &Chunks) {
     Worklist.push_back(C);
   };
 
-  auto AddSym = [&](SymbolBody *B) {
+  auto AddSym = [&](Symbol *B) {
     if (auto *Sym = dyn_cast<DefinedRegular>(B))
       Enqueue(Sym->getChunk());
     else if (auto *Sym = dyn_cast<DefinedImportData>(B))
@@ -47,23 +47,17 @@ void markLive(const std::vector<Chunk *> &Chunks) {
   };
 
   // Add GC root chunks.
-  for (SymbolBody *B : Config->GCRoot)
+  for (Symbol *B : Config->GCRoot)
     AddSym(B);
 
   while (!Worklist.empty()) {
     SectionChunk *SC = Worklist.pop_back_val();
-
-    // If this section was discarded, there are relocations referring to
-    // discarded sections. Ignore these sections to avoid crashing. They will be
-    // diagnosed during relocation processing.
-    if (SC->isDiscarded())
-      continue;
-
     assert(SC->isLive() && "We mark as live when pushing onto the worklist!");
 
     // Mark all symbols listed in the relocation table for this section.
-    for (SymbolBody *B : SC->symbols())
-      AddSym(B);
+    for (Symbol *B : SC->symbols())
+      if (B)
+        AddSym(B);
 
     // Mark associative sections if any.
     for (SectionChunk *C : SC->children())

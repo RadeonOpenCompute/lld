@@ -53,6 +53,7 @@ public:
   void readLinkerScript();
   void readVersionScript();
   void readDynamicList();
+  void readDefsym(StringRef Name);
 
 private:
   void addFile(StringRef Path);
@@ -269,6 +270,14 @@ void ScriptParser::readLinkerScript() {
   }
 }
 
+void ScriptParser::readDefsym(StringRef Name) {
+  Expr E = readExpr();
+  if (!atEOF())
+    setError("EOF expected, but got " + next());
+  SymbolAssignment *Cmd = make<SymbolAssignment>(Name, E, getCurrentLocation());
+  Script->SectionCommands.push_back(Cmd);
+}
+
 void ScriptParser::addFile(StringRef S) {
   if (IsUnderSysroot && S.startswith("/")) {
     SmallString<128> PathData;
@@ -341,20 +350,12 @@ void ScriptParser::readInclude() {
     return;
   }
 
-  // https://sourceware.org/binutils/docs/ld/File-Commands.html:
-  // The file will be searched for in the current directory, and in any
-  // directory specified with the -L option.
-  if (sys::fs::exists(Tok)) {
-    if (Optional<MemoryBufferRef> MB = readFile(Tok))
-      tokenize(*MB);
-    return;
-  }
-  if (Optional<std::string> Path = findFromSearchPaths(Tok)) {
+  if (Optional<std::string> Path = searchLinkerScript(Tok)) {
     if (Optional<MemoryBufferRef> MB = readFile(*Path))
       tokenize(*MB);
     return;
   }
-  setError("cannot open " + Tok);
+  setError("cannot find linker script " + Tok);
 }
 
 void ScriptParser::readOutput() {
@@ -422,7 +423,7 @@ void ScriptParser::readRegionAlias() {
     setError("redefinition of memory region '" + Alias + "'");
   if (!Script->MemoryRegions.count(Name))
     setError("memory region '" + Name + "' is not defined");
-  Script->MemoryRegions[Alias] = Script->MemoryRegions[Name];
+  Script->MemoryRegions.insert({Alias, Script->MemoryRegions[Name]});
 }
 
 void ScriptParser::readSearchDir() {
@@ -1325,4 +1326,8 @@ void elf::readVersionScript(MemoryBufferRef MB) {
 
 void elf::readDynamicList(MemoryBufferRef MB) {
   ScriptParser(MB).readDynamicList();
+}
+
+void elf::readDefsym(StringRef Name, MemoryBufferRef MB) {
+  ScriptParser(MB).readDefsym(Name);
 }
