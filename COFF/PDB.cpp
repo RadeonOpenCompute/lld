@@ -46,7 +46,6 @@
 #include "llvm/Object/COFF.h"
 #include "llvm/Support/BinaryByteStream.h"
 #include "llvm/Support/Endian.h"
-#include "llvm/Support/FileOutputBuffer.h"
 #include "llvm/Support/JamCRC.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/ScopedPrinter.h"
@@ -729,7 +728,7 @@ void PDBLinker::addObjectsToPDB() {
   std::vector<PublicSym32> Publics;
   Symtab->forEachSymbol([&Publics](Symbol *S) {
     // Only emit defined, live symbols that have a chunk.
-    auto *Def = dyn_cast<Defined>(S->body());
+    auto *Def = dyn_cast<Defined>(S);
     if (Def && Def->isLive() && Def->getChunk())
       Publics.push_back(createPublic(Def));
   });

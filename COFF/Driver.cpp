@@ -353,9 +353,12 @@ void LinkerDriver::addLibSearchPaths() {
   }
 }
 
-SymbolBody *LinkerDriver::addUndefined(StringRef Name) {
-  SymbolBody *B = Symtab->addUndefined(Name);
-  Config->GCRoot.insert(B);
+Symbol *LinkerDriver::addUndefined(StringRef Name) {
+  Symbol *B = Symtab->addUndefined(Name);
+  if (!B->IsGCRoot) {
+    B->IsGCRoot = true;
+    Config->GCRoot.push_back(B);
+  }
   return B;
 }
 
@@ -378,7 +381,7 @@ StringRef LinkerDriver::findDefaultEntry() {
   };
   for (auto E : Entries) {
     StringRef Entry = Symtab->findMangle(mangle(E[0]));
-    if (!Entry.empty() && !isa<Undefined>(Symtab->find(Entry)->body()))
+    if (!Entry.empty() && !isa<Undefined>(Symtab->find(Entry)))
       return mangle(E[1]);
   }
   return "";
@@ -801,7 +804,7 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
     Config->Force = true;
 
   // Handle /debug
-  if (Args.hasArg(OPT_debug)) {
+  if (Args.hasArg(OPT_debug) || Args.hasArg(OPT_debug_dwarf)) {
     Config->Debug = true;
     if (auto *Arg = Args.getLastArg(OPT_debugtype))
       Config->DebugTypes = parseDebugType(Arg->getValue());
@@ -896,49 +899,50 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
   if (auto *Arg = Args.getLastArg(OPT_implib))
     Config->Implib = Arg->getValue();
 
-  // Handle /opt
+  // Handle /opt.
+  bool DoGC = !Args.hasArg(OPT_debug);
+  unsigned ICFLevel = 1; // 0: off, 1: limited, 2: on
   for (auto *Arg : Args.filtered(OPT_opt)) {
     std::string Str = StringRef(Arg->getValue()).lower();
     SmallVector<StringRef, 1> Vec;
     StringRef(Str).split(Vec, ',');
     for (StringRef S : Vec) {
-      if (S == "noref") {
-        Config->DoGC = false;
-        Config->DoICF = false;
-        continue;
-      }
-      if (S == "icf" || S.startswith("icf=")) {
-        Config->DoICF = true;
-        continue;
-      }
-      if (S == "noicf") {
-        Config->DoICF = false;
-        continue;
-      }
-      if (S.startswith("lldlto=")) {
+      if (S == "ref") {
+        DoGC = true;
+      } else if (S == "noref") {
+        DoGC = false;
+      } else if (S == "icf" || S.startswith("icf=")) {
+        ICFLevel = 2;
+      } else if (S == "noicf") {
+        ICFLevel = 0;
+      } else if (S.startswith("lldlto=")) {
         StringRef OptLevel = S.substr(7);
         if (OptLevel.getAsInteger(10, Config->LTOOptLevel) ||
             Config->LTOOptLevel > 3)
           error("/opt:lldlto: invalid optimization level: " + OptLevel);
-        continue;
-      }
-      if (S.startswith("lldltojobs=")) {
+      } else if (S.startswith("lldltojobs=")) {
         StringRef Jobs = S.substr(11);
         if (Jobs.getAsInteger(10, Config->LTOJobs) || Config->LTOJobs == 0)
           error("/opt:lldltojobs: invalid job count: " + Jobs);
-        continue;
-      }
-      if (S.startswith("lldltopartitions=")) {
+      } else if (S.startswith("lldltopartitions=")) {
         StringRef N = S.substr(17);
         if (N.getAsInteger(10, Config->LTOPartitions) ||
             Config->LTOPartitions == 0)
           error("/opt:lldltopartitions: invalid partition count: " + N);
-        continue;
-      }
-      if (S != "ref" && S != "lbr" && S != "nolbr")
+      } else if (S != "lbr" && S != "nolbr")
         error("/opt: unknown option: " + S);
     }
   }
+
+  // Limited ICF is enabled if GC is enabled and ICF was never mentioned
+  // explicitly.
+  // FIXME: LLD only implements "limited" ICF, i.e. it only merges identical
+  // code. If the user passes /OPT:ICF explicitly, LLD should merge identical
+  // comdat readonly data.
+  if (ICFLevel == 1 && !DoGC)
+    ICFLevel = 0;
+  Config->DoGC = DoGC;
+  Config->DoICF = ICFLevel > 0;
 
   // Handle /lldsavetemps
   if (Args.hasArg(OPT_lldsavetemps))
@@ -961,6 +965,10 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
   // Handle /merge
   for (auto *Arg : Args.filtered(OPT_merge))
     parseMerge(Arg->getValue());
+
+  // Add default section merging rules after user rules. User rules take
+  // precedence, but we will emit a warning if there is a conflict.
+  parseMerge(".xdata=.rdata");
 
   // Handle /section
   for (auto *Arg : Args.filtered(OPT_section))
@@ -1008,8 +1016,7 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
       Args.hasFlag(OPT_allowisolation, OPT_allowisolation_no, true);
   Config->NxCompat = Args.hasFlag(OPT_nxcompat, OPT_nxcompat_no, true);
   Config->TerminalServerAware = Args.hasFlag(OPT_tsaware, OPT_tsaware_no, true);
-  if (Args.hasArg(OPT_nosymtab))
-    Config->WriteSymtab = false;
+  Config->DebugDwarf = Args.hasArg(OPT_debug_dwarf);
 
   Config->MapFile = getMapFile(Args);
 
@@ -1135,7 +1142,7 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
   }
 
   // Disable PDB generation if the user requested it.
-  if (Args.hasArg(OPT_nopdb))
+  if (Args.hasArg(OPT_nopdb) || Args.hasArg(OPT_debug_dwarf))
     Config->PDBPath = "";
 
   // Set default image base if /base is not given.
@@ -1184,7 +1191,7 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
       Symbol *Sym = Symtab->find(From);
       if (!Sym)
         continue;
-      if (auto *U = dyn_cast<Undefined>(Sym->body()))
+      if (auto *U = dyn_cast<Undefined>(Sym))
         if (!U->WeakAlias)
           U->WeakAlias = Symtab->addUndefined(To);
     }
@@ -1238,12 +1245,15 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
     AutoExporter Exporter;
 
     Symtab->forEachSymbol([=](Symbol *S) {
-      auto *Def = dyn_cast<Defined>(S->body());
+      auto *Def = dyn_cast<Defined>(S);
       if (!Exporter.shouldExport(Def))
         return;
       Export E;
       E.Name = Def->getName();
       E.Sym = Def;
+      if (Def->getChunk() &&
+          !(Def->getChunk()->getPermissions() & IMAGE_SCN_MEM_EXECUTE))
+        E.Data = true;
       Config->Exports.push_back(E);
     });
   }
@@ -1271,7 +1281,7 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
       continue;
     }
 
-    auto *DC = dyn_cast<DefinedCommon>(Sym->body());
+    auto *DC = dyn_cast<DefinedCommon>(Sym);
     if (!DC) {
       warn("/aligncomm symbol " + Name + " of wrong kind");
       continue;
