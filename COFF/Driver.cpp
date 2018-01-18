@@ -10,13 +10,13 @@
 #include "Driver.h"
 #include "Config.h"
 #include "InputFiles.h"
-#include "Memory.h"
 #include "MinGW.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
 #include "Writer.h"
 #include "lld/Common/Driver.h"
 #include "lld/Common/ErrorHandler.h"
+#include "lld/Common/Memory.h"
 #include "lld/Common/Version.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -49,10 +49,6 @@ namespace coff {
 
 Configuration *Config;
 LinkerDriver *Driver;
-
-BumpPtrAllocator BAlloc;
-StringSaver Saver{BAlloc};
-std::vector<SpecificAllocBase *> SpecificAllocBase::Instances;
 
 bool link(ArrayRef<const char *> Args, bool CanExitEarly, raw_ostream &Diag) {
   errorHandler().LogName = Args[0];
@@ -135,7 +131,7 @@ void LinkerDriver::addBuffer(std::unique_ptr<MemoryBuffer> MB,
   case file_magic::archive:
     if (WholeArchive) {
       std::unique_ptr<Archive> File =
-          check(Archive::create(MBRef),
+          CHECK(Archive::create(MBRef),
                 MBRef.getBufferIdentifier() + ": failed to parse archive");
 
       for (MemoryBufferRef M : getArchiveMembers(File.get()))
@@ -200,7 +196,7 @@ void LinkerDriver::enqueueArchiveMember(const Archive::Child &C,
                                         StringRef SymName,
                                         StringRef ParentName) {
   if (!C.getParent()->isThin()) {
-    MemoryBufferRef MB = check(
+    MemoryBufferRef MB = CHECK(
         C.getMemoryBufferRef(),
         "could not get the buffer for the member defining symbol " + SymName);
     enqueueTask([=]() { Driver->addArchiveBuffer(MB, SymName, ParentName); });
@@ -208,7 +204,7 @@ void LinkerDriver::enqueueArchiveMember(const Archive::Child &C,
   }
 
   auto Future = std::make_shared<std::future<MBErrPair>>(createFutureForFile(
-      check(C.getFullName(),
+      CHECK(C.getFullName(),
             "could not get the filename for the member defining symbol " +
                 SymName)));
   enqueueTask([=]() {
@@ -245,6 +241,9 @@ void LinkerDriver::parseDirectives(StringRef S) {
       if (Optional<StringRef> Path = findLib(Arg->getValue()))
         enqueuePath(*Path, false);
       break;
+    case OPT_entry:
+      Config->Entry = addUndefined(mangle(Arg->getValue()));
+      break;
     case OPT_export: {
       Export E = parseExport(Arg->getValue());
       if (Config->Machine == I386 && Config->MinGW) {
@@ -271,6 +270,10 @@ void LinkerDriver::parseDirectives(StringRef S) {
       break;
     case OPT_section:
       parseSection(Arg->getValue());
+      break;
+    case OPT_subsystem:
+      parseSubsystem(Arg->getValue(), &Config->Subsystem,
+                     &Config->MajorOSVersion, &Config->MinorOSVersion);
       break;
     case OPT_editandcontinue:
     case OPT_fastfail:
@@ -312,6 +315,8 @@ Optional<StringRef> LinkerDriver::findFile(StringRef Filename) {
   bool Seen = !VisitedFiles.insert(Path.lower()).second;
   if (Seen)
     return None;
+  if (Path.endswith_lower(".lib"))
+    VisitedLibs.insert(sys::path::filename(Path));
   return Path;
 }
 
@@ -353,9 +358,12 @@ void LinkerDriver::addLibSearchPaths() {
   }
 }
 
-SymbolBody *LinkerDriver::addUndefined(StringRef Name) {
-  SymbolBody *B = Symtab->addUndefined(Name);
-  Config->GCRoot.insert(B);
+Symbol *LinkerDriver::addUndefined(StringRef Name) {
+  Symbol *B = Symtab->addUndefined(Name);
+  if (!B->IsGCRoot) {
+    B->IsGCRoot = true;
+    Config->GCRoot.push_back(B);
+  }
   return B;
 }
 
@@ -378,7 +386,7 @@ StringRef LinkerDriver::findDefaultEntry() {
   };
   for (auto E : Entries) {
     StringRef Entry = Symtab->findMangle(mangle(E[0]));
-    if (!Entry.empty() && !isa<Undefined>(Symtab->find(Entry)->body()))
+    if (!Entry.empty() && !isa<Undefined>(Symtab->find(Entry)))
       return mangle(E[1]);
   }
   return "";
@@ -420,7 +428,7 @@ static std::string createResponseFile(const opt::InputArgList &Args,
     case OPT_manifestuac:
       break;
     default:
-      OS << toString(Arg) << "\n";
+      OS << toString(*Arg) << "\n";
     }
   }
 
@@ -525,8 +533,8 @@ static void createImportLibrary(bool AsLib) {
 }
 
 static void parseModuleDefs(StringRef Path) {
-  std::unique_ptr<MemoryBuffer> MB = check(
-    MemoryBuffer::getFile(Path, -1, false, true), "could not open " + Path);
+  std::unique_ptr<MemoryBuffer> MB = CHECK(
+      MemoryBuffer::getFile(Path, -1, false, true), "could not open " + Path);
   COFFModuleDefinition M = check(parseCOFFModuleDefinition(
       MB->getMemBufferRef(), Config->Machine, Config->MinGW));
 
@@ -571,7 +579,7 @@ static bool needsRebuilding(MemoryBufferRef MB) {
   // The MSVC linker doesn't support thin archives, so if it's a thin
   // archive, we always need to rebuild it.
   std::unique_ptr<Archive> File =
-      check(Archive::create(MB), "Failed to read " + MB.getBufferIdentifier());
+      CHECK(Archive::create(MB), "Failed to read " + MB.getBufferIdentifier());
   if (File->isThin())
     return true;
 
@@ -592,7 +600,7 @@ static bool needsRebuilding(MemoryBufferRef MB) {
 // its path is returned.
 static Optional<std::string>
 filterBitcodeFiles(StringRef Path, std::vector<std::string> &TemporaryFiles) {
-  std::unique_ptr<MemoryBuffer> MB = check(
+  std::unique_ptr<MemoryBuffer> MB = CHECK(
       MemoryBuffer::getFile(Path, -1, false, true), "could not open " + Path);
   MemoryBufferRef MBRef = MB->getMemBufferRef();
   file_magic Magic = identify_magic(MBRef.getBuffer());
@@ -605,7 +613,7 @@ filterBitcodeFiles(StringRef Path, std::vector<std::string> &TemporaryFiles) {
     return Path.str();
 
   std::unique_ptr<Archive> File =
-      check(Archive::create(MBRef),
+      CHECK(Archive::create(MBRef),
             MBRef.getBufferIdentifier() + ": failed to parse archive");
 
   std::vector<NewArchiveMember> New;
@@ -668,7 +676,7 @@ void LinkerDriver::invokeMSVC(opt::InputArgList &Args) {
       break;
     case OPT_opt:
       if (!StringRef(Arg->getValue()).startswith("lld"))
-        Rsp += toString(Arg) + " ";
+        Rsp += toString(*Arg) + " ";
       break;
     case OPT_INPUT: {
       if (Optional<StringRef> Path = doFindFile(Arg->getValue())) {
@@ -680,7 +688,7 @@ void LinkerDriver::invokeMSVC(opt::InputArgList &Args) {
       break;
     }
     default:
-      Rsp += toString(Arg) + "\n";
+      Rsp += toString(*Arg) + "\n";
     }
   }
 
@@ -797,11 +805,11 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
   errorHandler().Verbose = Config->Verbose;
 
   // Handle /force or /force:unresolved
-  if (Args.hasArg(OPT_force) || Args.hasArg(OPT_force_unresolved))
+  if (Args.hasArg(OPT_force, OPT_force_unresolved))
     Config->Force = true;
 
   // Handle /debug
-  if (Args.hasArg(OPT_debug)) {
+  if (Args.hasArg(OPT_debug, OPT_debug_dwarf, OPT_debug_ghash)) {
     Config->Debug = true;
     if (auto *Arg = Args.getLastArg(OPT_debugtype))
       Config->DebugTypes = parseDebugType(Arg->getValue());
@@ -809,9 +817,11 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
       Config->DebugTypes = getDefaultDebugType(Args);
   }
 
-  // Create a dummy PDB file to satisfy build sytem rules.
-  if (auto *Arg = Args.getLastArg(OPT_pdb))
-    Config->PDBPath = Arg->getValue();
+  // Handle /pdb
+  bool ShouldCreatePDB = Args.hasArg(OPT_debug, OPT_debug_ghash);
+  if (ShouldCreatePDB)
+    if (auto *Arg = Args.getLastArg(OPT_pdb))
+      Config->PDBPath = Arg->getValue();
 
   // Handle /noentry
   if (Args.hasArg(OPT_noentry)) {
@@ -896,49 +906,50 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
   if (auto *Arg = Args.getLastArg(OPT_implib))
     Config->Implib = Arg->getValue();
 
-  // Handle /opt
+  // Handle /opt.
+  bool DoGC = !Args.hasArg(OPT_debug);
+  unsigned ICFLevel = 1; // 0: off, 1: limited, 2: on
   for (auto *Arg : Args.filtered(OPT_opt)) {
     std::string Str = StringRef(Arg->getValue()).lower();
     SmallVector<StringRef, 1> Vec;
     StringRef(Str).split(Vec, ',');
     for (StringRef S : Vec) {
-      if (S == "noref") {
-        Config->DoGC = false;
-        Config->DoICF = false;
-        continue;
-      }
-      if (S == "icf" || S.startswith("icf=")) {
-        Config->DoICF = true;
-        continue;
-      }
-      if (S == "noicf") {
-        Config->DoICF = false;
-        continue;
-      }
-      if (S.startswith("lldlto=")) {
+      if (S == "ref") {
+        DoGC = true;
+      } else if (S == "noref") {
+        DoGC = false;
+      } else if (S == "icf" || S.startswith("icf=")) {
+        ICFLevel = 2;
+      } else if (S == "noicf") {
+        ICFLevel = 0;
+      } else if (S.startswith("lldlto=")) {
         StringRef OptLevel = S.substr(7);
         if (OptLevel.getAsInteger(10, Config->LTOOptLevel) ||
             Config->LTOOptLevel > 3)
           error("/opt:lldlto: invalid optimization level: " + OptLevel);
-        continue;
-      }
-      if (S.startswith("lldltojobs=")) {
+      } else if (S.startswith("lldltojobs=")) {
         StringRef Jobs = S.substr(11);
         if (Jobs.getAsInteger(10, Config->LTOJobs) || Config->LTOJobs == 0)
           error("/opt:lldltojobs: invalid job count: " + Jobs);
-        continue;
-      }
-      if (S.startswith("lldltopartitions=")) {
+      } else if (S.startswith("lldltopartitions=")) {
         StringRef N = S.substr(17);
         if (N.getAsInteger(10, Config->LTOPartitions) ||
             Config->LTOPartitions == 0)
           error("/opt:lldltopartitions: invalid partition count: " + N);
-        continue;
-      }
-      if (S != "ref" && S != "lbr" && S != "nolbr")
+      } else if (S != "lbr" && S != "nolbr")
         error("/opt: unknown option: " + S);
     }
   }
+
+  // Limited ICF is enabled if GC is enabled and ICF was never mentioned
+  // explicitly.
+  // FIXME: LLD only implements "limited" ICF, i.e. it only merges identical
+  // code. If the user passes /OPT:ICF explicitly, LLD should merge identical
+  // comdat readonly data.
+  if (ICFLevel == 1 && !DoGC)
+    ICFLevel = 0;
+  Config->DoGC = DoGC;
+  Config->DoICF = ICFLevel > 0;
 
   // Handle /lldsavetemps
   if (Args.hasArg(OPT_lldsavetemps))
@@ -950,7 +961,7 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
 
   // Handle /lldsavecachepolicy
   if (auto *Arg = Args.getLastArg(OPT_lldltocachepolicy))
-    Config->LTOCachePolicy = check(
+    Config->LTOCachePolicy = CHECK(
         parseCachePruningPolicy(Arg->getValue()),
         Twine("/lldltocachepolicy: invalid cache policy: ") + Arg->getValue());
 
@@ -1008,8 +1019,8 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
       Args.hasFlag(OPT_allowisolation, OPT_allowisolation_no, true);
   Config->NxCompat = Args.hasFlag(OPT_nxcompat, OPT_nxcompat_no, true);
   Config->TerminalServerAware = Args.hasFlag(OPT_tsaware, OPT_tsaware_no, true);
-  if (Args.hasArg(OPT_nosymtab))
-    Config->WriteSymtab = false;
+  Config->DebugDwarf = Args.hasArg(OPT_debug_dwarf);
+  Config->DebugGHashes = Args.hasArg(OPT_debug_ghash);
 
   Config->MapFile = getMapFile(Args);
 
@@ -1070,21 +1081,28 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
       Config->is64() &&
       Args.hasFlag(OPT_highentropyva, OPT_highentropyva_no, true);
 
+  if (!Config->DynamicBase &&
+      (Config->Machine == ARMNT || Config->Machine == ARM64))
+    error("/dynamicbase:no is not compatible with " +
+          machineToStr(Config->Machine));
+
   // Handle /entry and /dll
   if (auto *Arg = Args.getLastArg(OPT_entry)) {
     Config->Entry = addUndefined(mangle(Arg->getValue()));
-  } else if (Args.hasArg(OPT_dll) && !Config->NoEntry) {
-    StringRef S = (Config->Machine == I386) ? "__DllMainCRTStartup@12"
-                                            : "_DllMainCRTStartup";
-    Config->Entry = addUndefined(S);
-  } else if (!Config->NoEntry) {
-    // Windows specific -- If entry point name is not given, we need to
-    // infer that from user-defined entry name.
-    StringRef S = findDefaultEntry();
-    if (S.empty())
-      fatal("entry point must be defined");
-    Config->Entry = addUndefined(S);
-    log("Entry name inferred: " + S);
+  } else if (!Config->Entry && !Config->NoEntry) {
+    if (Args.hasArg(OPT_dll)) {
+      StringRef S = (Config->Machine == I386) ? "__DllMainCRTStartup@12"
+                                              : "_DllMainCRTStartup";
+      Config->Entry = addUndefined(S);
+    } else {
+      // Windows specific -- If entry point name is not given, we need to
+      // infer that from user-defined entry name.
+      StringRef S = findDefaultEntry();
+      if (S.empty())
+        fatal("entry point must be defined");
+      Config->Entry = addUndefined(S);
+      log("Entry name inferred: " + S);
+    }
   }
 
   // Handle /export
@@ -1129,14 +1147,10 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
   }
 
   // Put the PDB next to the image if no /pdb flag was passed.
-  if (Config->Debug && Config->PDBPath.empty()) {
+  if (ShouldCreatePDB && Config->PDBPath.empty()) {
     Config->PDBPath = Config->OutputFile;
     sys::path::replace_extension(Config->PDBPath, ".pdb");
   }
-
-  // Disable PDB generation if the user requested it.
-  if (Args.hasArg(OPT_nopdb))
-    Config->PDBPath = "";
 
   // Set default image base if /base is not given.
   if (Config->ImageBase == uint64_t(-1))
@@ -1157,6 +1171,8 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
   Symtab->addAbsolute(mangle("__guard_iat_table"), 0);
   Symtab->addAbsolute(mangle("__guard_longjmp_count"), 0);
   Symtab->addAbsolute(mangle("__guard_longjmp_table"), 0);
+  // Needed for MSVC 2017 15.5 CRT.
+  Symtab->addAbsolute(mangle("__enclave_config"), 0);
 
   // This code may add new undefined symbols to the link, which may enqueue more
   // symbol resolution tasks, so we need to continue executing tasks until we
@@ -1184,7 +1200,7 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
       Symbol *Sym = Symtab->find(From);
       if (!Sym)
         continue;
-      if (auto *U = dyn_cast<Undefined>(Sym->body()))
+      if (auto *U = dyn_cast<Undefined>(Sym))
         if (!U->WeakAlias)
           U->WeakAlias = Symtab->addUndefined(To);
     }
@@ -1238,12 +1254,15 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
     AutoExporter Exporter;
 
     Symtab->forEachSymbol([=](Symbol *S) {
-      auto *Def = dyn_cast<Defined>(S->body());
+      auto *Def = dyn_cast<Defined>(S);
       if (!Exporter.shouldExport(Def))
         return;
       Export E;
       E.Name = Def->getName();
       E.Sym = Def;
+      if (Def->getChunk() &&
+          !(Def->getChunk()->getPermissions() & IMAGE_SCN_MEM_EXECUTE))
+        E.Data = true;
       Config->Exports.push_back(E);
     });
   }
@@ -1271,7 +1290,7 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
       continue;
     }
 
-    auto *DC = dyn_cast<DefinedCommon>(Sym->body());
+    auto *DC = dyn_cast<DefinedCommon>(Sym);
     if (!DC) {
       warn("/aligncomm symbol " + Name + " of wrong kind");
       continue;

@@ -24,7 +24,6 @@ namespace lld {
 namespace elf {
 
 class InputFile;
-struct Symbol;
 
 enum ELFKind {
   ELFNoneKind,
@@ -105,6 +104,10 @@ struct Configuration {
   std::vector<SymbolVersion> VersionScriptLocals;
   std::vector<uint8_t> BuildIdVector;
   bool AllowMultipleDefinition;
+  bool AndroidPackDynRelocs = false;
+  bool ARMHasBlx = false;
+  bool ARMHasMovtMovw = false;
+  bool ARMJ1J2BranchEncoding = false;
   bool AsNeeded = false;
   bool Bsymbolic;
   bool BsymbolicFunctions;
@@ -116,12 +119,15 @@ struct Configuration {
   bool EmitRelocs;
   bool EnableNewDtags;
   bool ExportDynamic;
+  bool FixCortexA53Errata843419;
   bool GcSections;
   bool GdbIndex;
   bool GnuHash = false;
   bool HasDynamicList = false;
   bool HasDynSymTab;
   bool ICF;
+  bool ICFData;
+  bool MergeArmExidx;
   bool MipsN32Abi = false;
   bool NoGnuUnique;
   bool NoUndefinedVersion;

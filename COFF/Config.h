@@ -27,8 +27,7 @@ using llvm::StringRef;
 class DefinedAbsolute;
 class DefinedRelative;
 class StringChunk;
-struct Symbol;
-class SymbolBody;
+class Symbol;
 
 // Short aliases.
 static const auto AMD64 = llvm::COFF::IMAGE_FILE_MACHINE_AMD64;
@@ -40,7 +39,7 @@ static const auto I386 = llvm::COFF::IMAGE_FILE_MACHINE_I386;
 struct Export {
   StringRef Name;       // N in /export:N or /export:E=N
   StringRef ExtName;    // E in /export:E=N
-  SymbolBody *Sym = nullptr;
+  Symbol *Sym = nullptr;
   uint16_t Ordinal = 0;
   bool Noname = false;
   bool Data = false;
@@ -80,7 +79,7 @@ struct Configuration {
   llvm::COFF::MachineTypes Machine = IMAGE_FILE_MACHINE_UNKNOWN;
   bool Verbose = false;
   WindowsSubsystem Subsystem = llvm::COFF::IMAGE_SUBSYSTEM_UNKNOWN;
-  SymbolBody *Entry = nullptr;
+  Symbol *Entry = nullptr;
   bool NoEntry = false;
   std::string OutputFile;
   std::string ImportName;
@@ -89,13 +88,14 @@ struct Configuration {
   bool Relocatable = true;
   bool Force = false;
   bool Debug = false;
-  bool WriteSymtab = true;
+  bool DebugDwarf = false;
+  bool DebugGHashes = false;
   unsigned DebugTypes = static_cast<unsigned>(DebugType::None);
   llvm::SmallString<128> PDBPath;
   std::vector<llvm::StringRef> Argv;
 
   // Symbols in this set are considered as live by the garbage collector.
-  std::set<SymbolBody *> GCRoot;
+  std::vector<Symbol *> GCRoot;
 
   std::set<StringRef> NoDefaultLibs;
   bool NoDefaultLibAll = false;
@@ -106,7 +106,7 @@ struct Configuration {
   std::vector<Export> Exports;
   std::set<std::string> DelayLoads;
   std::map<std::string, int> DLLOrder;
-  SymbolBody *DelayLoadHelper = nullptr;
+  Symbol *DelayLoadHelper = nullptr;
 
   bool SaveTemps = false;
 

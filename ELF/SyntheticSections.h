@@ -26,15 +26,17 @@
 #include "InputSection.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/MC/StringTableBuilder.h"
+#include <functional>
 
 namespace lld {
 namespace elf {
+class SharedSymbol;
 
 class SyntheticSection : public InputSection {
 public:
   SyntheticSection(uint64_t Flags, uint32_t Type, uint32_t Alignment,
                    StringRef Name)
-      : InputSection(Flags, Type, Alignment, {}, Name,
+      : InputSection(nullptr, Flags, Type, Alignment, {}, Name,
                      InputSectionBase::Synthetic) {
     this->Live = true;
   }
@@ -45,7 +47,7 @@ public:
   virtual void finalizeContents() {}
   // If the section has the SHF_ALLOC flag and the size may be changed if
   // thunks are added, update the section size.
-  virtual void updateAllocSize() {}
+  virtual bool updateAllocSize() { return false; }
   // If any additional finalization of contents are needed post thunk creation.
   virtual void postThunkContents() {}
   virtual bool empty() const { return false; }
@@ -99,8 +101,7 @@ private:
   std::vector<CieRecord *> CieRecords;
 
   // CIE records are uniquified by their contents and personality functions.
-  llvm::DenseMap<std::pair<ArrayRef<uint8_t>, SymbolBody *>, CieRecord *>
-      CieMap;
+  llvm::DenseMap<std::pair<ArrayRef<uint8_t>, Symbol *>, CieRecord *> CieMap;
 };
 
 class GotSection : public SyntheticSection {
@@ -111,11 +112,11 @@ public:
   bool empty() const override;
   void writeTo(uint8_t *Buf) override;
 
-  void addEntry(SymbolBody &Sym);
-  bool addDynTlsEntry(SymbolBody &Sym);
+  void addEntry(Symbol &Sym);
+  bool addDynTlsEntry(Symbol &Sym);
   bool addTlsIndex();
-  uint64_t getGlobalDynAddr(const SymbolBody &B) const;
-  uint64_t getGlobalDynOffset(const SymbolBody &B) const;
+  uint64_t getGlobalDynAddr(const Symbol &B) const;
+  uint64_t getGlobalDynOffset(const Symbol &B) const;
 
   uint64_t getTlsIndexVA() { return this->getVA() + TlsIndexOff; }
   uint32_t getTlsIndexOff() const { return TlsIndexOff; }
@@ -160,7 +161,7 @@ public:
   bool empty() const override { return getSize() == 0; }
   size_t getSize() const override { return Size; }
 
-private:
+  static bool classof(const SectionBase *S) { return S->Bss; }
   uint64_t Size;
 };
 
@@ -169,21 +170,21 @@ public:
   MipsGotSection();
   void writeTo(uint8_t *Buf) override;
   size_t getSize() const override { return Size; }
-  void updateAllocSize() override;
+  bool updateAllocSize() override;
   void finalizeContents() override;
   bool empty() const override;
-  void addEntry(SymbolBody &Sym, int64_t Addend, RelExpr Expr);
-  bool addDynTlsEntry(SymbolBody &Sym);
+  void addEntry(Symbol &Sym, int64_t Addend, RelExpr Expr);
+  bool addDynTlsEntry(Symbol &Sym);
   bool addTlsIndex();
-  uint64_t getPageEntryOffset(const SymbolBody &B, int64_t Addend) const;
-  uint64_t getBodyEntryOffset(const SymbolBody &B, int64_t Addend) const;
-  uint64_t getGlobalDynOffset(const SymbolBody &B) const;
+  uint64_t getPageEntryOffset(const Symbol &B, int64_t Addend) const;
+  uint64_t getSymEntryOffset(const Symbol &B, int64_t Addend) const;
+  uint64_t getGlobalDynOffset(const Symbol &B) const;
 
   // Returns the symbol which corresponds to the first entry of the global part
   // of GOT on MIPS platform. It is required to fill up MIPS-specific dynamic
   // table properties.
   // Returns nullptr if the global part is empty.
-  const SymbolBody *getFirstGlobalEntry() const;
+  const Symbol *getFirstGlobalEntry() const;
 
   // Returns the number of entries in the local part of GOT including
   // the number of reserved entries.
@@ -243,7 +244,7 @@ private:
   // to the first index of "Page" entries allocated for this section.
   llvm::SmallMapVector<const OutputSection *, size_t, 16> PageIndexMap;
 
-  typedef std::pair<const SymbolBody *, uint64_t> GotEntry;
+  typedef std::pair<const Symbol *, uint64_t> GotEntry;
   typedef std::vector<GotEntry> GotEntries;
   // Map from Symbol-Addend pair to the GOT index.
   llvm::DenseMap<GotEntry, size_t> EntryIndexMap;
@@ -256,7 +257,7 @@ private:
   GotEntries GlobalEntries;
 
   // TLS entries.
-  std::vector<const SymbolBody *> TlsEntries;
+  std::vector<const Symbol *> TlsEntries;
 
   uint32_t TlsIndexOff = -1;
   uint64_t Size = 0;
@@ -265,13 +266,13 @@ private:
 class GotPltSection final : public SyntheticSection {
 public:
   GotPltSection();
-  void addEntry(SymbolBody &Sym);
+  void addEntry(Symbol &Sym);
   size_t getSize() const override;
   void writeTo(uint8_t *Buf) override;
   bool empty() const override { return Entries.empty(); }
 
 private:
-  std::vector<const SymbolBody *> Entries;
+  std::vector<const Symbol *> Entries;
 };
 
 // The IgotPltSection is a Got associated with the PltSection for GNU Ifunc
@@ -281,13 +282,13 @@ private:
 class IgotPltSection final : public SyntheticSection {
 public:
   IgotPltSection();
-  void addEntry(SymbolBody &Sym);
+  void addEntry(Symbol &Sym);
   size_t getSize() const override;
   void writeTo(uint8_t *Buf) override;
   bool empty() const override { return Entries.empty(); }
 
 private:
-  std::vector<const SymbolBody *> Entries;
+  std::vector<const Symbol *> Entries;
 };
 
 class StringTableSection final : public SyntheticSection {
@@ -310,8 +311,7 @@ private:
 class DynamicReloc {
 public:
   DynamicReloc(uint32_t Type, const InputSectionBase *InputSec,
-               uint64_t OffsetInSec, bool UseSymVA, SymbolBody *Sym,
-               int64_t Addend)
+               uint64_t OffsetInSec, bool UseSymVA, Symbol *Sym, int64_t Addend)
       : Type(Type), Sym(Sym), InputSec(InputSec), OffsetInSec(OffsetInSec),
         UseSymVA(UseSymVA), Addend(Addend) {}
 
@@ -323,7 +323,7 @@ public:
   uint32_t Type;
 
 private:
-  SymbolBody *Sym;
+  Symbol *Sym;
   const InputSectionBase *InputSec = nullptr;
   uint64_t OffsetInSec;
   bool UseSymVA;
@@ -337,30 +337,8 @@ template <class ELFT> class DynamicSection final : public SyntheticSection {
   typedef typename ELFT::Shdr Elf_Shdr;
   typedef typename ELFT::Sym Elf_Sym;
 
-  // The .dynamic section contains information for the dynamic linker.
-  // The section consists of fixed size entries, which consist of
-  // type and value fields. Value are one of plain integers, symbol
-  // addresses, or section addresses. This struct represents the entry.
-  struct Entry {
-    int32_t Tag;
-    union {
-      OutputSection *OutSec;
-      InputSection *InSec;
-      uint64_t Val;
-      const SymbolBody *Sym;
-    };
-    enum KindT { SecAddr, SecSize, SymAddr, PlainInt, InSecAddr } Kind;
-    Entry(int32_t Tag, OutputSection *OutSec, KindT Kind = SecAddr)
-        : Tag(Tag), OutSec(OutSec), Kind(Kind) {}
-    Entry(int32_t Tag, InputSection *Sec)
-        : Tag(Tag), InSec(Sec), Kind(InSecAddr) {}
-    Entry(int32_t Tag, uint64_t Val) : Tag(Tag), Val(Val), Kind(PlainInt) {}
-    Entry(int32_t Tag, const SymbolBody *Sym)
-        : Tag(Tag), Sym(Sym), Kind(SymAddr) {}
-  };
-
   // finalizeContents() fills this vector with the section contents.
-  std::vector<Entry> Entries;
+  std::vector<std::pair<int32_t, std::function<uint64_t()>>> Entries;
 
 public:
   DynamicSection();
@@ -369,33 +347,66 @@ public:
   size_t getSize() const override { return Size; }
 
 private:
-  void addEntries();
-  void add(Entry E) { Entries.push_back(E); }
+  void add(int32_t Tag, std::function<uint64_t()> Fn);
+  void addInt(int32_t Tag, uint64_t Val);
+  void addInSec(int32_t Tag, InputSection *Sec);
+  void addOutSec(int32_t Tag, OutputSection *Sec);
+  void addSize(int32_t Tag, OutputSection *Sec);
+  void addSym(int32_t Tag, Symbol *Sym);
+
   uint64_t Size = 0;
 };
 
-template <class ELFT> class RelocationSection final : public SyntheticSection {
+class RelocationBaseSection : public SyntheticSection {
+public:
+  RelocationBaseSection(StringRef Name, uint32_t Type, int32_t DynamicTag,
+                        int32_t SizeDynamicTag);
+  void addReloc(const DynamicReloc &Reloc);
+  bool empty() const override { return Relocs.empty(); }
+  size_t getSize() const override { return Relocs.size() * this->Entsize; }
+  size_t getRelativeRelocCount() const { return NumRelativeRelocs; }
+  void finalizeContents() override;
+  int32_t DynamicTag, SizeDynamicTag;
+
+protected:
+  std::vector<DynamicReloc> Relocs;
+  size_t NumRelativeRelocs = 0;
+};
+
+template <class ELFT>
+class RelocationSection final : public RelocationBaseSection {
   typedef typename ELFT::Rel Elf_Rel;
   typedef typename ELFT::Rela Elf_Rela;
 
 public:
   RelocationSection(StringRef Name, bool Sort);
-  void addReloc(const DynamicReloc &Reloc);
   unsigned getRelocOffset();
-  void finalizeContents() override;
   void writeTo(uint8_t *Buf) override;
-  bool empty() const override { return Relocs.empty(); }
-  size_t getSize() const override { return Relocs.size() * this->Entsize; }
-  size_t getRelativeRelocCount() const { return NumRelativeRelocs; }
 
 private:
   bool Sort;
-  size_t NumRelativeRelocs = 0;
-  std::vector<DynamicReloc> Relocs;
+};
+
+template <class ELFT>
+class AndroidPackedRelocationSection final : public RelocationBaseSection {
+  typedef typename ELFT::Rel Elf_Rel;
+  typedef typename ELFT::Rela Elf_Rela;
+
+public:
+  AndroidPackedRelocationSection(StringRef Name);
+
+  bool updateAllocSize() override;
+  size_t getSize() const override { return RelocData.size(); }
+  void writeTo(uint8_t *Buf) override {
+    memcpy(Buf, RelocData.data(), RelocData.size());
+  }
+
+private:
+  SmallVector<char, 0> RelocData;
 };
 
 struct SymbolTableEntry {
-  SymbolBody *Symbol;
+  Symbol *Sym;
   size_t StrTabOffset;
 };
 
@@ -405,9 +416,9 @@ public:
   void finalizeContents() override;
   void postThunkContents() override;
   size_t getSize() const override { return getNumSymbols() * Entsize; }
-  void addSymbol(SymbolBody *Body);
+  void addSymbol(Symbol *Sym);
   unsigned getNumSymbols() const { return Symbols.size() + 1; }
-  size_t getSymbolIndex(SymbolBody *Body);
+  size_t getSymbolIndex(Symbol *Sym);
   ArrayRef<SymbolTableEntry> getSymbols() const { return Symbols; }
 
 protected:
@@ -417,7 +428,7 @@ protected:
   StringTableSection &StrTabSec;
 
   llvm::once_flag OnceFlag;
-  llvm::DenseMap<SymbolBody *, size_t> SymbolIndexMap;
+  llvm::DenseMap<Symbol *, size_t> SymbolIndexMap;
   llvm::DenseMap<OutputSection *, size_t> SectionIndexMap;
 };
 
@@ -450,9 +461,10 @@ private:
   void writeHashTable(uint8_t *Buf);
 
   struct Entry {
-    SymbolBody *Body;
+    Symbol *Sym;
     size_t StrTabOffset;
     uint32_t Hash;
+    uint32_t BucketIdx;
   };
 
   std::vector<Entry> Symbols;
@@ -484,11 +496,11 @@ public:
   bool empty() const override { return Entries.empty(); }
   void addSymbols();
 
-  template <class ELFT> void addEntry(SymbolBody &Sym);
+  template <class ELFT> void addEntry(Symbol &Sym);
 
 private:
   unsigned getPltRelocOff() const;
-  std::vector<std::pair<const SymbolBody *, unsigned>> Entries;
+  std::vector<std::pair<const Symbol *, unsigned>> Entries;
   // Iplt always has HeaderSize of 0, the Plt HeaderSize is always non-zero
   size_t HeaderSize;
 };
@@ -773,6 +785,9 @@ public:
   ARMExidxSentinelSection();
   size_t getSize() const override { return 8; }
   void writeTo(uint8_t *Buf) override;
+  bool empty() const override;
+
+  InputSection *Highest = 0;
 };
 
 // A container for one or more linker generated thunks. Instances of these
@@ -796,14 +811,13 @@ private:
   size_t Size = 0;
 };
 
-template <class ELFT> void createCommonSections();
 InputSection *createInterpSection();
-template <class ELFT> MergeInputSection *createCommentSection();
+MergeInputSection *createCommentSection();
 void decompressSections();
 void mergeSections();
 
-SymbolBody *addSyntheticLocal(StringRef Name, uint8_t Type, uint64_t Value,
-                              uint64_t Size, InputSectionBase *Section);
+Symbol *addSyntheticLocal(StringRef Name, uint8_t Type, uint64_t Value,
+                          uint64_t Size, InputSectionBase &Section);
 
 // Linker generated sections which can be used as inputs.
 struct InX {
@@ -827,23 +841,20 @@ struct InX {
   static MipsRldMapSection *MipsRldMap;
   static PltSection *Plt;
   static PltSection *Iplt;
+  static RelocationBaseSection *RelaDyn;
+  static RelocationBaseSection *RelaPlt;
+  static RelocationBaseSection *RelaIplt;
   static StringTableSection *ShStrTab;
   static StringTableSection *StrTab;
   static SymbolTableBaseSection *SymTab;
 };
 
 template <class ELFT> struct In {
-  static RelocationSection<ELFT> *RelaDyn;
-  static RelocationSection<ELFT> *RelaPlt;
-  static RelocationSection<ELFT> *RelaIplt;
   static VersionDefinitionSection<ELFT> *VerDef;
   static VersionTableSection<ELFT> *VerSym;
   static VersionNeedSection<ELFT> *VerNeed;
 };
 
-template <class ELFT> RelocationSection<ELFT> *In<ELFT>::RelaDyn;
-template <class ELFT> RelocationSection<ELFT> *In<ELFT>::RelaPlt;
-template <class ELFT> RelocationSection<ELFT> *In<ELFT>::RelaIplt;
 template <class ELFT> VersionDefinitionSection<ELFT> *In<ELFT>::VerDef;
 template <class ELFT> VersionTableSection<ELFT> *In<ELFT>::VerSym;
 template <class ELFT> VersionNeedSection<ELFT> *In<ELFT>::VerNeed;

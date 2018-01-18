@@ -36,10 +36,10 @@ using llvm::COFF::WindowsSubsystem;
 using llvm::Optional;
 
 // Implemented in MarkLive.cpp.
-void markLive(const std::vector<Chunk *> &Chunks);
+void markLive(ArrayRef<Chunk *> Chunks);
 
 // Implemented in ICF.cpp.
-void doICF(const std::vector<Chunk *> &Chunks);
+void doICF(ArrayRef<Chunk *> Chunks);
 
 class COFFOptTable : public llvm::opt::OptTable {
 public:
@@ -96,7 +96,7 @@ private:
   std::set<std::string> VisitedFiles;
   std::set<std::string> VisitedLibs;
 
-  SymbolBody *addUndefined(StringRef Sym);
+  Symbol *addUndefined(StringRef Sym);
   StringRef mangle(StringRef Sym);
 
   // Windows specific -- "main" is not the only main function in Windows.
@@ -171,7 +171,7 @@ void assignExportOrdinals();
 void checkFailIfMismatch(StringRef Arg);
 
 // Convert Windows resource files (.res files) to a .obj file.
-MemoryBufferRef convertResToCOFF(const std::vector<MemoryBufferRef> &MBs);
+MemoryBufferRef convertResToCOFF(ArrayRef<MemoryBufferRef> MBs);
 
 void runMSVCLinker(std::string Rsp, ArrayRef<StringRef> Objects);
 
