@@ -37,7 +37,7 @@ class InputChunk {
 public:
   enum Kind { DataSegment, Function };
 
-  Kind kind() const { return SectionKind; };
+  Kind kind() const { return SectionKind; }
 
   uint32_t getSize() const { return data().size(); }
 
@@ -52,17 +52,16 @@ public:
 
   uint32_t getOutputOffset() const { return OutputOffset; }
   ArrayRef<WasmRelocation> getRelocations() const { return Relocations; }
-  StringRef getFileName() const { return File->getName(); }
 
   virtual StringRef getComdat() const = 0;
   virtual StringRef getName() const = 0;
 
-  bool Discarded = false;
   std::vector<OutputRelocation> OutRelocations;
   ObjFile *File;
 
-  // The garbage collector sets sections' Live bits.
-  // If GC is disabled, all sections are considered live by default.
+  // Signals that the section is part of the output.  The garbage collector,
+  // and COMDAT handling can set a sections' Live bit.
+  // If GC is disabled, all sections start out as live by default.
   unsigned Live : 1;
 
 protected:
