@@ -30,6 +30,7 @@
 #include "InputFiles.h"
 #include "InputSection.h"
 #include "LinkerScript.h"
+#include "MarkLive.h"
 #include "OutputSections.h"
 #include "ScriptParser.h"
 #include "Strings.h"
@@ -691,6 +692,7 @@ void LinkerDriver::readConfigs(opt::InputArgList &Args) {
       Args.hasFlag(OPT_warn_symbol_ordering, OPT_no_warn_symbol_ordering, true);
   Config->ZCombreloc = !hasZOption(Args, "nocombreloc");
   Config->ZExecstack = hasZOption(Args, "execstack");
+  Config->ZHazardplt = hasZOption(Args, "hazardplt");
   Config->ZNocopyreloc = hasZOption(Args, "nocopyreloc");
   Config->ZNodelete = hasZOption(Args, "nodelete");
   Config->ZNodlopen = hasZOption(Args, "nodlopen");
@@ -1078,9 +1080,10 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &Args) {
   if (errorCount())
     return;
 
-  // Handle undefined symbols in DSOs.
-  if (!Config->Shared)
-    Symtab->scanShlibUndefined<ELFT>();
+  // We want to declare linker script's symbols early,
+  // so that we can version them.
+  // They also might be exported if referenced by DSOs.
+  Script->declareSymbols();
 
   // Handle the -exclude-libs option.
   if (Args.hasArg(OPT_exclude_libs))
@@ -1094,10 +1097,6 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &Args) {
   // We need to create some reserved symbols such as _end. Create them.
   if (!Config->Relocatable)
     addReservedSymbols();
-
-  // We want to declare linker script's symbols early,
-  // so that we can version them.
-  Script->declareSymbols();
 
   // Apply version scripts.
   //
