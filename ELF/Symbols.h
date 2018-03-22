@@ -85,7 +85,7 @@ public:
   unsigned InVersionScript : 1;
 
   // The file from which this symbol was created.
-  InputFile *File = nullptr;
+  InputFile *File;
 
   bool includeInDynsym() const;
   uint8_t computeBinding() const;
@@ -102,13 +102,13 @@ public:
 
   // True is this is an undefined weak symbol. This only works once
   // all input files have been added.
-  bool isUndefWeak() const;
+  bool isUndefWeak() const {
+    // See comment on Lazy the details.
+    return isWeak() && (isUndefined() || isLazy());
+  }
 
-  InputFile *getFile() const;
   StringRef getName() const { return Name; }
-  uint8_t getVisibility() const { return StOther & 0x3; }
   void parseSymbolVersion();
-  void copyFrom(Symbol *Other);
 
   bool isInGot() const { return GotIndex != -1U; }
   bool isInPlt() const { return PltIndex != -1U; }
@@ -130,12 +130,12 @@ public:
   uint32_t GlobalDynIndex = -1;
 
 protected:
-  Symbol(Kind K, StringRefZ Name, uint8_t Binding, uint8_t StOther,
-         uint8_t Type)
-      : Binding(Binding), SymbolKind(K), NeedsPltAddr(false),
+  Symbol(Kind K, InputFile *File, StringRefZ Name, uint8_t Binding,
+         uint8_t StOther, uint8_t Type)
+      : Binding(Binding), File(File), SymbolKind(K), NeedsPltAddr(false),
         IsInGlobalMipsGot(false), Is32BitMipsGot(false), IsInIplt(false),
-        IsInIgot(false), IsPreemptible(false), Type(Type), StOther(StOther),
-        Name(Name) {}
+        IsInIgot(false), IsPreemptible(false), Used(!Config->GcSections),
+        Type(Type), StOther(StOther), Name(Name) {}
 
   const unsigned SymbolKind : 8;
 
@@ -156,6 +156,9 @@ public:
   unsigned IsInIgot : 1;
 
   unsigned IsPreemptible : 1;
+
+  // True if an undefined or shared symbol is used from a live section.
+  unsigned Used : 1;
 
   // The following fields have the same meaning as the ELF symbol attributes.
   uint8_t Type;    // symbol type
@@ -182,9 +185,9 @@ protected:
 // Represents a symbol that is defined in the current output file.
 class Defined : public Symbol {
 public:
-  Defined(StringRefZ Name, uint8_t Binding, uint8_t StOther, uint8_t Type,
-          uint64_t Value, uint64_t Size, SectionBase *Section)
-      : Symbol(DefinedKind, Name, Binding, StOther, Type), Value(Value),
+  Defined(InputFile *File, StringRefZ Name, uint8_t Binding, uint8_t StOther,
+          uint8_t Type, uint64_t Value, uint64_t Size, SectionBase *Section)
+      : Symbol(DefinedKind, File, Name, Binding, StOther, Type), Value(Value),
         Size(Size), Section(Section) {}
 
   static bool classof(const Symbol *S) { return S->isDefined(); }
@@ -196,8 +199,9 @@ public:
 
 class Undefined : public Symbol {
 public:
-  Undefined(StringRefZ Name, uint8_t Binding, uint8_t StOther, uint8_t Type)
-      : Symbol(UndefinedKind, Name, Binding, StOther, Type) {}
+  Undefined(InputFile *File, StringRefZ Name, uint8_t Binding, uint8_t StOther,
+            uint8_t Type)
+      : Symbol(UndefinedKind, File, Name, Binding, StOther, Type) {}
 
   static bool classof(const Symbol *S) { return S->kind() == UndefinedKind; }
 };
@@ -206,14 +210,14 @@ class SharedSymbol : public Symbol {
 public:
   static bool classof(const Symbol *S) { return S->kind() == SharedKind; }
 
-  SharedSymbol(StringRef Name, uint8_t Binding, uint8_t StOther, uint8_t Type,
-               uint64_t Value, uint64_t Size, uint32_t Alignment,
-               const void *Verdef)
-      : Symbol(SharedKind, Name, Binding, StOther, Type), Verdef(Verdef),
-        Value(Value), Size(Size), Alignment(Alignment) {
+  SharedSymbol(InputFile &File, StringRef Name, uint8_t Binding,
+               uint8_t StOther, uint8_t Type, uint64_t Value, uint64_t Size,
+               uint32_t Alignment, uint32_t VerdefIndex)
+      : Symbol(SharedKind, &File, Name, Binding, StOther, Type), Value(Value),
+        Size(Size), VerdefIndex(VerdefIndex), Alignment(Alignment) {
     // GNU ifunc is a mechanism to allow user-supplied functions to
     // resolve PLT slot values at load-time. This is contrary to the
-    // regualr symbol resolution scheme in which symbols are resolved just
+    // regular symbol resolution scheme in which symbols are resolved just
     // by name. Using this hook, you can program how symbols are solved
     // for you program. For example, you can make "memcpy" to be resolved
     // to a SSE-enabled version of memcpy only when a machine running the
@@ -231,18 +235,19 @@ public:
       this->Type = llvm::ELF::STT_FUNC;
   }
 
-  template <class ELFT> SharedFile<ELFT> *getFile() const {
-    return cast<SharedFile<ELFT>>(Symbol::getFile());
+  template <class ELFT> SharedFile<ELFT> &getFile() const {
+    return *cast<SharedFile<ELFT>>(File);
   }
-
-  // This field is a pointer to the symbol's version definition.
-  const void *Verdef;
 
   // If not null, there is a copy relocation to this section.
   InputSection *CopyRelSec = nullptr;
 
   uint64_t Value; // st_value
   uint64_t Size;  // st_size
+
+  // This field is a index to the symbol's version definition.
+  uint32_t VerdefIndex;
+
   uint32_t Alignment;
 };
 
@@ -264,8 +269,9 @@ public:
   InputFile *fetch();
 
 protected:
-  Lazy(Kind K, StringRef Name, uint8_t Type)
-      : Symbol(K, Name, llvm::ELF::STB_GLOBAL, llvm::ELF::STV_DEFAULT, Type) {}
+  Lazy(Kind K, InputFile &File, StringRef Name, uint8_t Type)
+      : Symbol(K, &File, Name, llvm::ELF::STB_GLOBAL, llvm::ELF::STV_DEFAULT,
+               Type) {}
 };
 
 // This class represents a symbol defined in an archive file. It is
@@ -274,12 +280,13 @@ protected:
 // symbol.
 class LazyArchive : public Lazy {
 public:
-  LazyArchive(const llvm::object::Archive::Symbol S, uint8_t Type)
-      : Lazy(LazyArchiveKind, S.getName(), Type), Sym(S) {}
+  LazyArchive(InputFile &File, const llvm::object::Archive::Symbol S,
+              uint8_t Type)
+      : Lazy(LazyArchiveKind, File, S.getName(), Type), Sym(S) {}
 
   static bool classof(const Symbol *S) { return S->kind() == LazyArchiveKind; }
 
-  ArchiveFile *getFile();
+  ArchiveFile &getFile();
   InputFile *fetch();
 
 private:
@@ -290,11 +297,12 @@ private:
 // --start-lib and --end-lib options.
 class LazyObject : public Lazy {
 public:
-  LazyObject(StringRef Name, uint8_t Type) : Lazy(LazyObjectKind, Name, Type) {}
+  LazyObject(InputFile &File, StringRef Name, uint8_t Type)
+      : Lazy(LazyObjectKind, File, Name, Type) {}
 
   static bool classof(const Symbol *S) { return S->kind() == LazyObjectKind; }
 
-  LazyObjFile *getFile();
+  LazyObjFile &getFile();
   InputFile *fetch();
 };
 
@@ -341,7 +349,7 @@ union SymbolUnion {
 void printTraceSymbol(Symbol *Sym);
 
 template <typename T, typename... ArgT>
-void replaceSymbol(Symbol *S, InputFile *File, ArgT &&... Arg) {
+void replaceSymbol(Symbol *S, ArgT &&... Arg) {
   static_assert(sizeof(T) <= sizeof(SymbolUnion), "SymbolUnion too small");
   static_assert(alignof(T) <= alignof(SymbolUnion),
                 "SymbolUnion not aligned enough");
@@ -351,7 +359,6 @@ void replaceSymbol(Symbol *S, InputFile *File, ArgT &&... Arg) {
   Symbol Sym = *S;
 
   new (S) T(std::forward<ArgT>(Arg)...);
-  S->File = File;
 
   S->VersionId = Sym.VersionId;
   S->Visibility = Sym.Visibility;

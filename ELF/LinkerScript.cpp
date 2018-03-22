@@ -14,7 +14,6 @@
 #include "LinkerScript.h"
 #include "Config.h"
 #include "InputSection.h"
-#include "Memory.h"
 #include "OutputSections.h"
 #include "Strings.h"
 #include "SymbolTable.h"
@@ -22,6 +21,7 @@
 #include "SyntheticSections.h"
 #include "Target.h"
 #include "Writer.h"
+#include "lld/Common/Memory.h"
 #include "lld/Common/Threads.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
@@ -87,7 +87,7 @@ OutputSection *LinkerScript::createOutputSection(StringRef Name,
     // There was a forward reference.
     Sec = SecRef;
   } else {
-    Sec = make<OutputSection>(Name, SHT_PROGBITS, 0);
+    Sec = make<OutputSection>(Name, SHT_NOBITS, 0);
     if (!SecRef)
       SecRef = Sec;
   }
@@ -184,6 +184,8 @@ static std::string getFilename(InputFile *File) {
 }
 
 bool LinkerScript::shouldKeep(InputSectionBase *S) {
+  if (KeptSections.empty())
+    return false;
   std::string Filename = getFilename(S->File);
   for (InputSectionDescription *ID : KeptSections)
     if (ID->FilePat.match(Filename))
@@ -533,7 +535,7 @@ void LinkerScript::addOrphanSections() {
     if (!S->Live || S->Parent)
       continue;
 
-    StringRef Name = getOutputSectionName(S->Name);
+    StringRef Name = getOutputSectionName(S);
 
     if (Config->OrphanHandling == OrphanHandlingPolicy::Error)
       error(toString(S) + " is being placed in '" + Name + "'");
@@ -606,13 +608,6 @@ void LinkerScript::switchTo(OutputSection *Sec) {
 
   Ctx->OutSec = Sec;
   Ctx->OutSec->Addr = advance(0, Ctx->OutSec->Alignment);
-
-  // If neither AT nor AT> is specified for an allocatable section, the linker
-  // will set the LMA such that the difference between VMA and LMA for the
-  // section is the same as the preceding output section in the same region
-  // https://sourceware.org/binutils/docs-2.20/ld/Output-Section-LMA.html
-  if (Ctx->LMAOffset)
-    Ctx->OutSec->LMAOffset = Ctx->LMAOffset();
 }
 
 // This function searches for a memory region to place the given output
@@ -660,17 +655,33 @@ void LinkerScript::assignOffsets(OutputSection *Sec) {
   if (Ctx->MemRegion)
     Dot = Ctx->MemRegionOffset[Ctx->MemRegion];
 
+  switchTo(Sec);
+
   if (Sec->LMAExpr) {
     uint64_t D = Dot;
     Ctx->LMAOffset = [=] { return Sec->LMAExpr().getValue() - D; };
   }
 
-  switchTo(Sec);
+  if (!Sec->LMARegionName.empty()) {
+    if (MemoryRegion *MR = MemoryRegions.lookup(Sec->LMARegionName)) {
+      uint64_t Offset = MR->Origin - Dot;
+      Ctx->LMAOffset = [=] { return Offset; };
+    } else {
+      error("memory region '" + Sec->LMARegionName + "' not declared");
+    }
+  }
 
-  // We do not support custom layout for compressed debug sectons.
-  // At this point we already know their size and have compressed content.
-  if (Ctx->OutSec->Flags & SHF_COMPRESSED)
-    return;
+  // If neither AT nor AT> is specified for an allocatable section, the linker
+  // will set the LMA such that the difference between VMA and LMA for the
+  // section is the same as the preceding output section in the same region
+  // https://sourceware.org/binutils/docs-2.20/ld/Output-Section-LMA.html
+  if (Ctx->LMAOffset)
+    Ctx->OutSec->LMAOffset = Ctx->LMAOffset();
+
+  // The Size previously denoted how many InputSections had been added to this
+  // section, and was used for sorting SHF_LINK_ORDER sections. Reset it to
+  // compute the actual size value.
+  Sec->Size = 0;
 
   // We visited SectionsCommands from processSectionCommands to
   // layout sections. Now, we visit SectionsCommands again to fix
@@ -686,6 +697,8 @@ void LinkerScript::assignOffsets(OutputSection *Sec) {
     if (auto *Cmd = dyn_cast<ByteCommand>(Base)) {
       Cmd->Offset = Dot - Ctx->OutSec->Addr;
       Dot += Cmd->Size;
+      if (Ctx->MemRegion)
+        Ctx->MemRegionOffset[Ctx->MemRegion] += Cmd->Size;
       Ctx->OutSec->Size = Dot - Ctx->OutSec->Addr;
       continue;
     }
@@ -976,8 +989,13 @@ ExprValue LinkerScript::getSymbolValue(StringRef Name, const Twine &Loc) {
     return 0;
   }
 
-  if (auto *Sym = dyn_cast_or_null<Defined>(Symtab->find(Name)))
-    return {Sym->Section, false, Sym->Value, Loc};
+  if (Symbol *Sym = Symtab->find(Name)) {
+    if (auto *DS = dyn_cast<Defined>(Sym))
+      return {DS->Section, false, DS->Value, Loc};
+    if (auto *SS = dyn_cast<SharedSymbol>(Sym))
+      if (!ErrorOnMissingSection || SS->CopyRelSec)
+        return {SS->CopyRelSec, false, 0, Loc};
+  }
 
   error(Loc + ": symbol not found: " + Name);
   return 0;

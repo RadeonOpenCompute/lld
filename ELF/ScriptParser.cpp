@@ -17,11 +17,11 @@
 #include "Driver.h"
 #include "InputSection.h"
 #include "LinkerScript.h"
-#include "Memory.h"
 #include "OutputSections.h"
 #include "ScriptLexer.h"
 #include "Symbols.h"
 #include "Target.h"
+#include "lld/Common/Memory.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
@@ -151,6 +151,9 @@ static ExprValue add(ExprValue A, ExprValue B) {
 }
 
 static ExprValue sub(ExprValue A, ExprValue B) {
+  // The distance between two symbols in sections is absolute.
+  if (!A.isAbsolute() && !B.isAbsolute())
+    return A.getValue() - B.getValue();
   return {A.Sec, false, A.getSectionOffset() - B.getValue(), A.Loc};
 }
 
@@ -705,8 +708,14 @@ OutputSection *ScriptParser::readOutputSectionDescription(StringRef OutSec) {
 
   if (consume(">"))
     Cmd->MemoryRegionName = next();
-  else if (peek().startswith(">"))
-    Cmd->MemoryRegionName = next().drop_front();
+
+  if (consume("AT")) {
+    expect(">");
+    Cmd->LMARegionName = next();
+  }
+
+  if (Cmd->LMAExpr && !Cmd->LMARegionName.empty())
+    error("section can't have both LMA and a load region");
 
   Cmd->Phdrs = readOutputSectionPhdrs();
 
@@ -871,13 +880,6 @@ Expr ScriptParser::readConstant() {
 // "0x" or suffixed with "H") and decimal numbers. Decimal numbers may
 // have "K" (Ki) or "M" (Mi) suffixes.
 static Optional<uint64_t> parseInt(StringRef Tok) {
-  // Negative number
-  if (Tok.startswith("-")) {
-    if (Optional<uint64_t> Val = parseInt(Tok.substr(1)))
-      return -*Val;
-    return None;
-  }
-
   // Hexadecimal
   uint64_t Val;
   if (Tok.startswith_lower("0x")) {
@@ -921,7 +923,10 @@ ByteCommand *ScriptParser::readByteCommand(StringRef Tok) {
 
 StringRef ScriptParser::readParenLiteral() {
   expect("(");
+  bool Orig = InExpr;
+  InExpr = false;
   StringRef Tok = next();
+  InExpr = Orig;
   expect(")");
   return Tok;
 }

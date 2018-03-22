@@ -30,12 +30,13 @@
 
 namespace lld {
 namespace elf {
+class SharedSymbol;
 
 class SyntheticSection : public InputSection {
 public:
   SyntheticSection(uint64_t Flags, uint32_t Type, uint32_t Alignment,
                    StringRef Name)
-      : InputSection(Flags, Type, Alignment, {}, Name,
+      : InputSection(nullptr, Flags, Type, Alignment, {}, Name,
                      InputSectionBase::Synthetic) {
     this->Live = true;
   }
@@ -346,8 +347,6 @@ public:
   size_t getSize() const override { return Size; }
 
 private:
-  void addEntries();
-
   void add(int32_t Tag, std::function<uint64_t()> Fn);
   void addInt(int32_t Tag, uint64_t Val);
   void addInSec(int32_t Tag, InputSection *Sec);
@@ -362,6 +361,9 @@ class RelocationBaseSection : public SyntheticSection {
 public:
   RelocationBaseSection(StringRef Name, uint32_t Type, int32_t DynamicTag,
                         int32_t SizeDynamicTag);
+  void addReloc(uint32_t DynType, InputSectionBase *InputSec,
+                uint64_t OffsetInSec, bool UseSymVA, Symbol *Sym,
+                int64_t Addend, RelExpr Expr, RelType Type);
   void addReloc(const DynamicReloc &Reloc);
   bool empty() const override { return Relocs.empty(); }
   size_t getSize() const override { return Relocs.size() * this->Entsize; }
@@ -465,6 +467,7 @@ private:
     Symbol *Sym;
     size_t StrTabOffset;
     uint32_t Hash;
+    uint32_t BucketIdx;
   };
 
   std::vector<Entry> Symbols;
@@ -484,13 +487,13 @@ private:
   size_t Size = 0;
 };
 
-// The PltSection is used for both the Plt and Iplt. The former always has a
+// The PltSection is used for both the Plt and Iplt. The former usually has a
 // header as its first entry that is used at run-time to resolve lazy binding.
 // The latter is used for GNU Ifunc symbols, that will be subject to a
 // Target->IRelativeRel.
 class PltSection : public SyntheticSection {
 public:
-  PltSection(size_t HeaderSize);
+  PltSection(bool IsIplt);
   void writeTo(uint8_t *Buf) override;
   size_t getSize() const override;
   bool empty() const override { return Entries.empty(); }
@@ -501,8 +504,8 @@ public:
 private:
   unsigned getPltRelocOff() const;
   std::vector<std::pair<const Symbol *, unsigned>> Entries;
-  // Iplt always has HeaderSize of 0, the Plt HeaderSize is always non-zero
   size_t HeaderSize;
+  bool IsIplt;
 };
 
 // GdbIndexChunk is created for each .debug_info section and contains
@@ -785,6 +788,12 @@ public:
   ARMExidxSentinelSection();
   size_t getSize() const override { return 8; }
   void writeTo(uint8_t *Buf) override;
+  bool empty() const override;
+
+  // The last section referenced by a regular .ARM.exidx section.
+  // It is found and filled in Writer<ELFT>::resolveShfLinkOrder().
+  // The sentinel points at the end of that section.
+  InputSection *Highest = nullptr;
 };
 
 // A container for one or more linker generated thunks. Instances of these
@@ -809,12 +818,12 @@ private:
 };
 
 InputSection *createInterpSection();
-template <class ELFT> MergeInputSection *createCommentSection();
+MergeInputSection *createCommentSection();
 void decompressSections();
 void mergeSections();
 
 Symbol *addSyntheticLocal(StringRef Name, uint8_t Type, uint64_t Value,
-                          uint64_t Size, InputSectionBase *Section);
+                          uint64_t Size, InputSectionBase &Section);
 
 // Linker generated sections which can be used as inputs.
 struct InX {
@@ -838,23 +847,20 @@ struct InX {
   static MipsRldMapSection *MipsRldMap;
   static PltSection *Plt;
   static PltSection *Iplt;
+  static RelocationBaseSection *RelaDyn;
+  static RelocationBaseSection *RelaPlt;
+  static RelocationBaseSection *RelaIplt;
   static StringTableSection *ShStrTab;
   static StringTableSection *StrTab;
   static SymbolTableBaseSection *SymTab;
 };
 
 template <class ELFT> struct In {
-  static RelocationBaseSection *RelaDyn;
-  static RelocationSection<ELFT> *RelaPlt;
-  static RelocationSection<ELFT> *RelaIplt;
   static VersionDefinitionSection<ELFT> *VerDef;
   static VersionTableSection<ELFT> *VerSym;
   static VersionNeedSection<ELFT> *VerNeed;
 };
 
-template <class ELFT> RelocationBaseSection *In<ELFT>::RelaDyn;
-template <class ELFT> RelocationSection<ELFT> *In<ELFT>::RelaPlt;
-template <class ELFT> RelocationSection<ELFT> *In<ELFT>::RelaIplt;
 template <class ELFT> VersionDefinitionSection<ELFT> *In<ELFT>::VerDef;
 template <class ELFT> VersionTableSection<ELFT> *In<ELFT>::VerSym;
 template <class ELFT> VersionNeedSection<ELFT> *In<ELFT>::VerNeed;

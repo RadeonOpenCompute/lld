@@ -134,6 +134,8 @@ void BitcodeCompiler::add(BitcodeFile &F) {
     if (auto *Cmd = dyn_cast<SymbolAssignment>(Base))
       ScriptSymbols.insert(Cmd->Name);
 
+  bool IsExecutable = !Config->Shared && !Config->Relocatable;
+
   // Provide a resolution to the LTO API for each symbol.
   for (const lto::InputFile::Symbol &ObjSym : Obj.symbols()) {
     Symbol *Sym = Syms[SymNum];
@@ -145,7 +147,7 @@ void BitcodeCompiler::add(BitcodeFile &F) {
     // flags an undefined in IR with a definition in ASM as prevailing.
     // Once IRObjectFile is fixed to report only one symbol this hack can
     // be removed.
-    R.Prevailing = !ObjSym.isUndefined() && Sym->getFile() == &F;
+    R.Prevailing = !ObjSym.isUndefined() && Sym->File == &F;
 
     // We ask LTO to preserve following global symbols:
     // 1) All symbols when doing relocatable link, so that them can be used
@@ -156,6 +158,9 @@ void BitcodeCompiler::add(BitcodeFile &F) {
     R.VisibleToRegularObj = Config->Relocatable || Sym->IsUsedInRegularObj ||
                             (R.Prevailing && Sym->includeInDynsym()) ||
                             UsedStartStop.count(ObjSym.getSectionName());
+    R.FinalDefinitionInLinkageUnit =
+        Sym->isDefined() && (IsExecutable || Sym->Visibility != STV_DEFAULT);
+
     if (R.Prevailing)
       undefine(Sym);
 
