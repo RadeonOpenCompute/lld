@@ -17,20 +17,24 @@
 #include "llvm/Object/Wasm.h"
 #include "llvm/Support/MemoryBuffer.h"
 
+#include "Symbols.h"
 #include "WriterUtils.h"
 
 #include <vector>
 
+using llvm::object::Archive;
 using llvm::object::WasmObjectFile;
 using llvm::object::WasmSection;
 using llvm::object::WasmSymbol;
-using llvm::object::Archive;
 using llvm::wasm::WasmImport;
+using llvm::wasm::WasmSignature;
+using llvm::wasm::WasmRelocation;
 
 namespace lld {
 namespace wasm {
 
-class Symbol;
+class InputChunk;
+class InputFunction;
 class InputSegment;
 
 class InputFile {
@@ -89,52 +93,52 @@ public:
 
   void dumpInfo() const;
 
-  uint32_t relocateTypeIndex(uint32_t Original) const;
   uint32_t relocateFunctionIndex(uint32_t Original) const;
-  uint32_t relocateGlobalIndex(uint32_t Original) const;
-  uint32_t relocateTableIndex(uint32_t Original) const;
   uint32_t getRelocatedAddress(uint32_t Index) const;
+  uint32_t calcNewIndex(const WasmRelocation &Reloc) const;
 
-  // Returns true if the given function index is an imported function,
-  // as opposed to the locally defined function.
-  bool isImportedFunction(uint32_t Index) const;
-
-  size_t NumFunctionImports() const { return FunctionImports; }
-  size_t NumGlobalImports() const { return GlobalImports; }
-
-  int32_t FunctionIndexOffset = 0;
-  int32_t GlobalIndexOffset = 0;
-  int32_t TableIndexOffset = 0;
   const WasmSection *CodeSection = nullptr;
-  std::vector<OutputRelocation> CodeRelocations;
-  int32_t CodeOffset = 0;
   const WasmSection *DataSection = nullptr;
 
   std::vector<uint32_t> TypeMap;
   std::vector<InputSegment *> Segments;
+  std::vector<InputFunction *> Functions;
 
-  const std::vector<Symbol *> &getSymbols() { return Symbols; }
+  ArrayRef<Symbol *> getSymbols() { return Symbols; }
+  ArrayRef<Symbol *> getTableSymbols() { return TableSymbols; }
 
 private:
-  Symbol *createDefined(const WasmSymbol &Sym,
-                        const InputSegment *Segment = nullptr);
-  Symbol *createUndefined(const WasmSymbol &Sym);
+  uint32_t relocateTypeIndex(uint32_t Original) const;
+  uint32_t relocateGlobalIndex(uint32_t Original) const;
+  uint32_t relocateTableIndex(uint32_t Original) const;
+
+  Symbol *createDefined(const WasmSymbol &Sym, Symbol::Kind Kind,
+                        const InputSegment *Segment = nullptr,
+                        InputFunction *Function = nullptr,
+                        uint32_t Address = UINT32_MAX);
+  Symbol *createUndefined(const WasmSymbol &Sym, Symbol::Kind Kind,
+                          const WasmSignature *Signature = nullptr);
   void initializeSymbols();
-  InputSegment *getSegment(const WasmSymbol &WasmSym);
-  const Symbol *getFunctionSymbol(uint32_t Index) const;
-  const Symbol *getGlobalSymbol(uint32_t Index) const;
+  InputSegment *getSegment(const WasmSymbol &WasmSym) const;
+  const WasmSignature *getFunctionSig(const WasmSymbol &Sym) const;
+  uint32_t getGlobalValue(const WasmSymbol &Sym) const;
+  InputFunction *getFunction(const WasmSymbol &Sym) const;
+  bool isExcludedByComdat(InputChunk *Chunk) const;
 
   // List of all symbols referenced or defined by this file.
   std::vector<Symbol *> Symbols;
 
   // List of all function symbols indexed by the function index space
-  std::vector<const Symbol *> FunctionSymbols;
+  std::vector<Symbol *> FunctionSymbols;
 
   // List of all global symbols indexed by the global index space
-  std::vector<const Symbol *> GlobalSymbols;
+  std::vector<Symbol *> GlobalSymbols;
 
-  uint32_t GlobalImports = 0;
-  uint32_t FunctionImports = 0;
+  // List of all indirect symbols indexed by table index space.
+  std::vector<Symbol *> TableSymbols;
+
+  uint32_t NumGlobalImports = 0;
+  uint32_t NumFunctionImports = 0;
   std::unique_ptr<WasmObjectFile> WasmObj;
 };
 
@@ -143,7 +147,7 @@ llvm::Optional<MemoryBufferRef> readFile(StringRef Path);
 
 } // namespace wasm
 
-std::string toString(wasm::InputFile *File);
+std::string toString(const wasm::InputFile *File);
 
 } // namespace lld
 

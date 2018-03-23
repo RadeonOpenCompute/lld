@@ -4,10 +4,9 @@ add_public_tablegen_target(WasmOptionsTableGen)
 
 add_lld_library(lldWasm
   Driver.cpp
+  InputChunks.cpp
   InputFiles.cpp
-  InputSegment.cpp
   OutputSections.cpp
-  Strings.cpp
   SymbolTable.cpp
   Symbols.cpp
   Writer.cpp
@@ -24,5 +23,4 @@ add_lld_library(lldWasm
 
   LINK_LIBS
   lldCommon
-  lldCore
   )

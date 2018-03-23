@@ -9,10 +9,11 @@
 
 #include "lld/Common/Driver.h"
 #include "Config.h"
-#include "Memory.h"
 #include "SymbolTable.h"
 #include "Writer.h"
+#include "lld/Common/Args.h"
 #include "lld/Common/ErrorHandler.h"
+#include "lld/Common/Memory.h"
 #include "lld/Common/Threads.h"
 #include "lld/Common/Version.h"
 #include "llvm/ADT/Twine.h"
@@ -25,7 +26,6 @@
 using namespace llvm;
 using namespace llvm::sys;
 using namespace llvm::wasm;
-using llvm::sys::Process;
 
 using namespace lld;
 using namespace lld::wasm;
@@ -60,9 +60,7 @@ private:
 
 } // anonymous namespace
 
-std::vector<SpecificAllocBase *> lld::wasm::SpecificAllocBase::Instances;
 Configuration *lld::wasm::Config;
-BumpPtrAllocator lld::wasm::BAlloc;
 
 bool lld::wasm::link(ArrayRef<const char *> Args, bool CanExitEarly,
                      raw_ostream &Error) {
@@ -104,52 +102,6 @@ static const opt::OptTable::Info OptInfo[] = {
 #undef OPTION
 };
 
-static std::vector<StringRef> getArgs(opt::InputArgList &Args, int Id) {
-  std::vector<StringRef> V;
-  for (auto *Arg : Args.filtered(Id))
-    V.push_back(Arg->getValue());
-  return V;
-}
-
-static int getInteger(opt::InputArgList &Args, unsigned Key, int Default) {
-  int V = Default;
-  if (auto *Arg = Args.getLastArg(Key)) {
-    StringRef S = Arg->getValue();
-    if (S.getAsInteger(10, V))
-      error(Arg->getSpelling() + ": number expected, but got " + S);
-  }
-  return V;
-}
-
-static uint64_t getZOptionValue(opt::InputArgList &Args, StringRef Key,
-                                uint64_t Default) {
-  for (auto *Arg : Args.filtered(OPT_z)) {
-    StringRef Value = Arg->getValue();
-    size_t Pos = Value.find("=");
-    if (Pos != StringRef::npos && Key == Value.substr(0, Pos)) {
-      Value = Value.substr(Pos + 1);
-      uint64_t Res;
-      if (Value.getAsInteger(0, Res))
-        error("invalid " + Key + ": " + Value);
-      return Res;
-    }
-  }
-  return Default;
-}
-
-static std::vector<StringRef> getLines(MemoryBufferRef MB) {
-  SmallVector<StringRef, 0> Arr;
-  MB.getBuffer().split(Arr, '\n');
-
-  std::vector<StringRef> Ret;
-  for (StringRef S : Arr) {
-    S = S.trim();
-    if (!S.empty() && S[0] != '#')
-      Ret.push_back(S);
-  }
-  return Ret;
-}
-
 // Set color diagnostics according to -color-diagnostics={auto,always,never}
 // or -no-color-diagnostics flags.
 static void handleColorDiagnostics(opt::InputArgList &Args) {
@@ -182,33 +134,8 @@ static Optional<std::string> findFile(StringRef Path1, const Twine &Path2) {
   return None;
 }
 
-// Inject a new wasm global into the output binary with the given value.
-// Wasm global are used in relocatable object files to model symbol imports
-// and exports.  In the final exectuable the only use of wasm globals is the
-// for the exlicit stack pointer (__stack_pointer).
-static void addSyntheticGlobal(StringRef Name, int32_t Value) {
-  log("injecting global: " + Name);
-  Symbol *S = Symtab->addDefinedGlobal(Name);
-  S->setOutputIndex(Config->SyntheticGlobals.size());
-
-  WasmGlobal Global;
-  Global.Mutable = true;
-  Global.Type = WASM_TYPE_I32;
-  Global.InitExpr.Opcode = WASM_OPCODE_I32_CONST;
-  Global.InitExpr.Value.Int32 = Value;
-  Config->SyntheticGlobals.emplace_back(S, Global);
-}
-
-// Inject a new undefined symbol into the link.  This will cause the link to
-// fail unless this symbol can be found.
-static void addSyntheticUndefinedFunction(StringRef Name) {
-  log("injecting undefined func: " + Name);
-  Symtab->addUndefinedFunction(Name);
-}
-
 static void printHelp(const char *Argv0) {
-  WasmOptTable Table;
-  Table.PrintHelp(outs(), Argv0, "LLVM Linker", false);
+  WasmOptTable().PrintHelp(outs(), Argv0, "LLVM Linker", false);
 }
 
 WasmOptTable::WasmOptTable() : OptTable(OptInfo) {}
@@ -226,16 +153,36 @@ opt::InputArgList WasmOptTable::parse(ArrayRef<const char *> Argv) {
   return Args;
 }
 
+// Currently we allow a ".imports" to live alongside a library. This can
+// be used to specify a list of symbols which can be undefined at link
+// time (imported from the environment.  For example libc.a include an
+// import file that lists the syscall functions it relies on at runtime.
+// In the long run this information would be better stored as a symbol
+// attribute/flag in the object file itself.
+// See: https://github.com/WebAssembly/tool-conventions/issues/35
+static void readImportFile(StringRef Filename) {
+  if (Optional<MemoryBufferRef> Buf = readFile(Filename))
+    for (StringRef Sym : args::getLines(*Buf))
+      Config->AllowUndefinedSymbols.insert(Sym);
+}
+
 void LinkerDriver::addFile(StringRef Path) {
   Optional<MemoryBufferRef> Buffer = readFile(Path);
   if (!Buffer.hasValue())
     return;
   MemoryBufferRef MBRef = *Buffer;
 
-  if (identify_magic(MBRef.getBuffer()) == file_magic::archive)
+  if (identify_magic(MBRef.getBuffer()) == file_magic::archive) {
+    SmallString<128> ImportFile = Path;
+    path::replace_extension(ImportFile, ".imports");
+    if (fs::exists(ImportFile))
+      readImportFile(ImportFile.str());
+
     Files.push_back(make<ArchiveFile>(MBRef));
-  else
-    Files.push_back(make<ObjFile>(MBRef));
+    return;
+  }
+
+  Files.push_back(make<ObjFile>(MBRef));
 }
 
 // Add a given library by searching it from input search paths.
@@ -266,6 +213,15 @@ void LinkerDriver::createFiles(opt::InputArgList &Args) {
     error("no input files");
 }
 
+static StringRef getEntry(opt::InputArgList &Args, StringRef Default) {
+  auto *Arg = Args.getLastArg(OPT_entry, OPT_no_entry);
+  if (!Arg)
+    return Default;
+  if (Arg->getOption().getID() == OPT_no_entry)
+    return "";
+  return Arg->getValue();
+}
+
 void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
   WasmOptTable Parser;
   opt::InputArgList Args = Parser.parse(ArgsArr.slice(1));
@@ -278,12 +234,12 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
 
   // Parse and evaluate -mllvm options.
   std::vector<const char *> V;
-  V.push_back("lld-link (LLVM option parsing)");
+  V.push_back("wasm-ld (LLVM option parsing)");
   for (auto *Arg : Args.filtered(OPT_mllvm))
     V.push_back(Arg->getValue());
   cl::ParseCommandLineOptions(V.size(), V.data());
 
-  errorHandler().ErrorLimit = getInteger(Args, OPT_error_limit, 20);
+  errorHandler().ErrorLimit = args::getInteger(Args, OPT_error_limit, 20);
 
   if (Args.hasArg(OPT_version) || Args.hasArg(OPT_v)) {
     outs() << getLLDVersion() << "\n";
@@ -291,27 +247,29 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
   }
 
   Config->AllowUndefined = Args.hasArg(OPT_allow_undefined);
+  Config->CheckSignatures =
+      Args.hasFlag(OPT_check_signatures, OPT_no_check_signatures, false);
   Config->EmitRelocs = Args.hasArg(OPT_emit_relocs);
-  Config->Entry = Args.getLastArgValue(OPT_entry);
+  Config->Entry = getEntry(Args, Args.hasArg(OPT_relocatable) ? "" : "_start");
   Config->ImportMemory = Args.hasArg(OPT_import_memory);
   Config->OutputFile = Args.getLastArgValue(OPT_o);
   Config->Relocatable = Args.hasArg(OPT_relocatable);
-  Config->SearchPaths = getArgs(Args, OPT_L);
+  Config->SearchPaths = args::getStrings(Args, OPT_L);
   Config->StripAll = Args.hasArg(OPT_strip_all);
   Config->StripDebug = Args.hasArg(OPT_strip_debug);
-  Config->Sysroot = Args.getLastArgValue(OPT_sysroot);
   errorHandler().Verbose = Args.hasArg(OPT_verbose);
   ThreadsEnabled = Args.hasFlag(OPT_threads, OPT_no_threads, true);
+  if (Config->Relocatable)
+    Config->EmitRelocs = true;
 
-  Config->InitialMemory = getInteger(Args, OPT_initial_memory, 0);
-  Config->GlobalBase = getInteger(Args, OPT_global_base, 1024);
-  Config->MaxMemory = getInteger(Args, OPT_max_memory, 0);
-  Config->ZStackSize = getZOptionValue(Args, "stack-size", WasmPageSize);
+  Config->InitialMemory = args::getInteger(Args, OPT_initial_memory, 0);
+  Config->GlobalBase = args::getInteger(Args, OPT_global_base, 1024);
+  Config->MaxMemory = args::getInteger(Args, OPT_max_memory, 0);
+  Config->ZStackSize =
+      args::getZOptionValue(Args, OPT_z, "stack-size", WasmPageSize);
 
   if (auto *Arg = Args.getLastArg(OPT_allow_undefined_file))
-    if (Optional<MemoryBufferRef> Buf = readFile(Arg->getValue()))
-      for (StringRef Sym : getLines(*Buf))
-        Config->AllowUndefinedSymbols.insert(Sym);
+    readImportFile(Arg->getValue());
 
   if (Config->OutputFile.empty())
     error("no output file specified");
@@ -321,13 +279,32 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
 
   if (Config->Relocatable && !Config->Entry.empty())
     error("entry point specified for relocatable output file");
+  if (Config->Relocatable && Args.hasArg(OPT_undefined))
+    error("undefined symbols specified for relocatable output file");
 
+  Symbol *EntrySym = nullptr;
   if (!Config->Relocatable) {
-    if (Config->Entry.empty())
-      Config->Entry = "_start";
-    addSyntheticUndefinedFunction(Config->Entry);
+    static WasmSignature Signature = {{}, WASM_TYPE_NORESULT};
+    if (!Config->Entry.empty())
+      EntrySym = Symtab->addUndefinedFunction(Config->Entry, &Signature);
 
-    addSyntheticGlobal("__stack_pointer", 0);
+    // Handle the `--undefined <sym>` options.
+    for (auto* Arg : Args.filtered(OPT_undefined))
+      Symtab->addUndefinedFunction(Arg->getValue(), nullptr);
+
+    // Create linker-synthetic symbols
+    // __wasm_call_ctors:
+    //    Function that directly calls all ctors in priority order.
+    // __stack_pointer:
+    //    Wasm global that holds the address of the top of the explict
+    //    value stack in linear memory.
+    // __dso_handle;
+    //    Global in calls to __cxa_atexit to determine current DLL
+    Config->CtorSymbol = Symtab->addDefinedFunction(
+        "__wasm_call_ctors", &Signature, WASM_SYMBOL_VISIBILITY_HIDDEN);
+    Config->StackPointerSymbol = Symtab->addDefinedGlobal("__stack_pointer");
+    Config->HeapBaseSymbol = Symtab->addDefinedGlobal("__heap_base");
+    Symtab->addDefinedGlobal("__dso_handle")->setVirtualAddress(0);
   }
 
   createFiles(Args);
@@ -342,15 +319,34 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
   // Make sure we have resolved all symbols.
   if (!Config->Relocatable && !Config->AllowUndefined) {
     Symtab->reportRemainingUndefines();
-    if (errorCount())
-      return;
+  } else {
+    // When we allow undefined symbols we cannot include those defined in
+    // -u/--undefined since these undefined symbols have only names and no
+    // function signature, which means they cannot be written to the final
+    // output.
+    for (auto* Arg : Args.filtered(OPT_undefined)) {
+      Symbol *Sym = Symtab->find(Arg->getValue());
+      if (!Sym->isDefined())
+        error("function forced with --undefined not found: " + Sym->getName());
+    }
+  }
+  if (errorCount())
+    return;
+
+  for (auto *Arg : Args.filtered(OPT_export)) {
+    Symbol *Sym = Symtab->find(Arg->getValue());
+    if (!Sym || !Sym->isDefined())
+      error("symbol exported via --export not found: " +
+            Twine(Arg->getValue()));
+    else
+      Sym->setHidden(false);
   }
 
-  if (!Config->Entry.empty()) {
-    Symbol *Sym = Symtab->find(Config->Entry);
-    if (!Sym->isFunction())
-      fatal("entry point is not a function: " + Sym->getName());
-  }
+  if (EntrySym)
+    EntrySym->setHidden(false);
+
+  if (errorCount())
+    return;
 
   // Write the result to the file.
   writeResult();

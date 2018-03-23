@@ -11,10 +11,10 @@
 #include "Chunks.h"
 #include "Config.h"
 #include "Driver.h"
-#include "Memory.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
 #include "lld/Common/ErrorHandler.h"
+#include "lld/Common/Memory.h"
 #include "llvm-c/lto.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Triple.h"
@@ -63,7 +63,7 @@ ArchiveFile::ArchiveFile(MemoryBufferRef M) : InputFile(ArchiveKind, M) {}
 
 void ArchiveFile::parse() {
   // Parse a MemoryBufferRef as an archive file.
-  File = check(Archive::create(MB), toString(this));
+  File = CHECK(Archive::create(MB), this);
 
   // Read the symbol table to construct Lazy objects.
   for (const Archive::Symbol &Sym : File->symbols())
@@ -73,7 +73,7 @@ void ArchiveFile::parse() {
 // Returns a buffer pointing to a member file containing a given symbol.
 void ArchiveFile::addMember(const Archive::Symbol *Sym) {
   const Archive::Child &C =
-      check(Sym->getMember(),
+      CHECK(Sym->getMember(),
             "could not get the member for symbol " + Sym->getName());
 
   // Return an empty buffer if we have already returned the same buffer.
@@ -88,10 +88,10 @@ std::vector<MemoryBufferRef> getArchiveMembers(Archive *File) {
   Error Err = Error::success();
   for (const ErrorOr<Archive::Child> &COrErr : File->children(Err)) {
     Archive::Child C =
-        check(COrErr,
+        CHECK(COrErr,
               File->getFileName() + ": could not get the child of the archive");
     MemoryBufferRef MBRef =
-        check(C.getMemoryBufferRef(),
+        CHECK(C.getMemoryBufferRef(),
               File->getFileName() +
                   ": could not get the buffer for a child of the archive");
     V.push_back(MBRef);
@@ -104,7 +104,7 @@ std::vector<MemoryBufferRef> getArchiveMembers(Archive *File) {
 
 void ObjFile::parse() {
   // Parse a memory buffer as a COFF file.
-  std::unique_ptr<Binary> Bin = check(createBinary(MB), toString(this));
+  std::unique_ptr<Binary> Bin = CHECK(createBinary(MB), this);
 
   if (auto *Obj = dyn_cast<COFFObjectFile>(Bin.get())) {
     Bin.release();
@@ -116,7 +116,6 @@ void ObjFile::parse() {
   // Read section and symbol tables.
   initializeChunks();
   initializeSymbols();
-  initializeSEH();
 }
 
 // We set SectionChunk pointers in the SparseChunks vector to this value
@@ -153,7 +152,12 @@ SectionChunk *ObjFile::readSection(uint32_t SectionNumber,
     fatal("getSectionName failed: #" + Twine(SectionNumber) + ": " +
           EC.message());
   if (Name == ".sxdata") {
-    SXData = Sec;
+    ArrayRef<uint8_t> Data;
+    COFFObj->getSectionContents(Sec, Data);
+    if (Data.size() % 4 != 0)
+      fatal(".sxdata must be an array of symbol table indices");
+    SXData = {reinterpret_cast<const ulittle32_t *>(Data.data()),
+              Data.size() / 4};
     return nullptr;
   }
   if (Name == ".drectve") {
@@ -370,19 +374,6 @@ Optional<Symbol *> ObjFile::createDefined(
   return createRegular(Sym);
 }
 
-void ObjFile::initializeSEH() {
-  if (!SEHCompat || !SXData)
-    return;
-  ArrayRef<uint8_t> A;
-  COFFObj->getSectionContents(SXData, A);
-  if (A.size() % 4 != 0)
-    fatal(".sxdata must be an array of symbol table indices");
-  auto *I = reinterpret_cast<const ulittle32_t *>(A.data());
-  auto *E = reinterpret_cast<const ulittle32_t *>(A.data() + A.size());
-  for (; I != E; ++I)
-    SEHandlers.insert(Symbols[*I]);
-}
-
 MachineTypes ObjFile::getMachineType() {
   if (COFFObj)
     return static_cast<MachineTypes>(COFFObj->getMachine());
@@ -502,14 +493,13 @@ static StringRef getBasename(StringRef Path) {
 }
 
 // Returns a string in the format of "foo.obj" or "foo.obj(bar.lib)".
-std::string lld::toString(coff::InputFile *File) {
+std::string lld::toString(const coff::InputFile *File) {
   if (!File)
     return "<internal>";
   if (File->ParentName.empty())
-    return File->getName().lower();
+    return File->getName();
 
-  std::string Res =
-      (getBasename(File->ParentName) + "(" + getBasename(File->getName()) + ")")
-          .str();
-  return StringRef(Res).lower();
+  return (getBasename(File->ParentName) + "(" + getBasename(File->getName()) +
+          ")")
+      .str();
 }

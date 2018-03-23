@@ -89,6 +89,8 @@ struct Configuration {
   bool Force = false;
   bool Debug = false;
   bool DebugDwarf = false;
+  bool DebugGHashes = false;
+  bool ShowTiming = false;
   unsigned DebugTypes = static_cast<unsigned>(DebugType::None);
   llvm::SmallString<128> PDBPath;
   std::vector<llvm::StringRef> Argv;
@@ -163,7 +165,6 @@ struct Configuration {
   uint32_t MinorImageVersion = 0;
   uint32_t MajorOSVersion = 6;
   uint32_t MinorOSVersion = 0;
-  bool CanExitEarly = false;
   bool DynamicBase = true;
   bool AllowBind = true;
   bool NxCompat = true;
@@ -173,6 +174,7 @@ struct Configuration {
   bool HighEntropyVA = false;
   bool AppContainer = false;
   bool MinGW = false;
+  bool WarnLocallyDefinedImported = true;
 };
 
 extern Configuration *Config;

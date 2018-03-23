@@ -11,9 +11,10 @@
 #include "Config.h"
 #include "Driver.h"
 #include "LTO.h"
-#include "Memory.h"
 #include "Symbols.h"
 #include "lld/Common/ErrorHandler.h"
+#include "lld/Common/Memory.h"
+#include "lld/Common/Timer.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -23,6 +24,8 @@ using namespace llvm;
 
 namespace lld {
 namespace coff {
+
+static Timer LTOTimer("LTO", Timer::root());
 
 SymbolTable *Symtab;
 
@@ -63,6 +66,7 @@ static void errorOrWarn(const Twine &S) {
 
 void SymbolTable::reportRemainingUndefines() {
   SmallPtrSet<Symbol *, 8> Undefs;
+  DenseMap<Symbol *, Symbol *> LocalImports;
 
   for (auto &I : SymMap) {
     Symbol *Sym = I.second;
@@ -98,6 +102,7 @@ void SymbolTable::reportRemainingUndefines() {
         auto *D = cast<Defined>(Imp);
         replaceSymbol<DefinedLocalImport>(Sym, Name, D);
         LocalImportChunks.push_back(cast<DefinedLocalImport>(Sym)->getChunk());
+        LocalImports[Sym] = D;
         continue;
       }
     }
@@ -109,17 +114,31 @@ void SymbolTable::reportRemainingUndefines() {
     Undefs.insert(Sym);
   }
 
-  if (Undefs.empty())
+  if (Undefs.empty() && LocalImports.empty())
     return;
 
-  for (Symbol *B : Config->GCRoot)
+  for (Symbol *B : Config->GCRoot) {
     if (Undefs.count(B))
       errorOrWarn("<root>: undefined symbol: " + B->getName());
+    if (Config->WarnLocallyDefinedImported)
+      if (Symbol *Imp = LocalImports.lookup(B))
+        warn("<root>: locally defined symbol imported: " + Imp->getName() +
+             " (defined in " + toString(Imp->getFile()) + ")");
+  }
 
-  for (ObjFile *File : ObjFile::Instances)
-    for (Symbol *Sym : File->getSymbols())
-      if (Sym && Undefs.count(Sym))
+  for (ObjFile *File : ObjFile::Instances) {
+    for (Symbol *Sym : File->getSymbols()) {
+      if (!Sym)
+        continue;
+      if (Undefs.count(Sym))
         errorOrWarn(toString(File) + ": undefined symbol: " + Sym->getName());
+      if (Config->WarnLocallyDefinedImported)
+        if (Symbol *Imp = LocalImports.lookup(Sym))
+          warn(toString(File) + ": locally defined symbol imported: " +
+               Imp->getName() + " (defined in " + toString(Imp->getFile()) +
+               ")");
+    }
+  }
 }
 
 std::pair<Symbol *, bool> SymbolTable::insert(StringRef Name) {
@@ -291,7 +310,7 @@ DefinedImportThunk *SymbolTable::addImportThunk(StringRef Name,
 std::vector<Chunk *> SymbolTable::getChunks() {
   std::vector<Chunk *> Res;
   for (ObjFile *File : ObjFile::Instances) {
-    std::vector<Chunk *> &V = File->getChunks();
+    ArrayRef<Chunk *> V = File->getChunks();
     Res.insert(Res.end(), V.begin(), V.end());
   }
   return Res;
@@ -368,6 +387,8 @@ std::vector<StringRef> SymbolTable::compileBitcodeFiles() {
 void SymbolTable::addCombinedLTOObjects() {
   if (BitcodeFile::Instances.empty())
     return;
+
+  ScopedTimer T(LTOTimer);
   for (StringRef Object : compileBitcodeFiles()) {
     auto *Obj = make<ObjFile>(MemoryBufferRef(Object, "lto.tmp"));
     Obj->parse();

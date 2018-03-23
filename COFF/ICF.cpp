@@ -21,6 +21,7 @@
 #include "Chunks.h"
 #include "Symbols.h"
 #include "lld/Common/ErrorHandler.h"
+#include "lld/Common/Timer.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Parallel.h"
@@ -34,9 +35,11 @@ using namespace llvm;
 namespace lld {
 namespace coff {
 
+static Timer ICFTimer("ICF", Timer::root());
+
 class ICF {
 public:
-  void run(const std::vector<Chunk *> &V);
+  void run(ArrayRef<Chunk *> V);
 
 private:
   void segregate(size_t Begin, size_t End, bool Constant);
@@ -206,7 +209,9 @@ void ICF::forEachClass(std::function<void(size_t, size_t)> Fn) {
 // Merge identical COMDAT sections.
 // Two sections are considered the same if their section headers,
 // contents and relocations are all the same.
-void ICF::run(const std::vector<Chunk *> &Vec) {
+void ICF::run(ArrayRef<Chunk *> Vec) {
+  ScopedTimer T(ICFTimer);
+
   // Collect only mergeable sections and group by hash value.
   uint32_t NextId = 1;
   for (Chunk *C : Vec) {
@@ -257,7 +262,7 @@ void ICF::run(const std::vector<Chunk *> &Vec) {
 }
 
 // Entry point to ICF.
-void doICF(const std::vector<Chunk *> &Chunks) { ICF().run(Chunks); }
+void doICF(ArrayRef<Chunk *> Chunks) { ICF().run(Chunks); }
 
 } // namespace coff
 } // namespace lld

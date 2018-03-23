@@ -119,12 +119,16 @@ struct Configuration {
   bool EmitRelocs;
   bool EnableNewDtags;
   bool ExportDynamic;
+  bool FixCortexA53Errata843419;
   bool GcSections;
   bool GdbIndex;
   bool GnuHash = false;
   bool HasDynamicList = false;
   bool HasDynSymTab;
   bool ICF;
+  bool IgnoreDataAddressEquality;
+  bool IgnoreFunctionAddressEquality;
+  bool MergeArmExidx;
   bool MipsN32Abi = false;
   bool NoGnuUnique;
   bool NoUndefinedVersion;
